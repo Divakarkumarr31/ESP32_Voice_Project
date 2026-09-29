@@ -19,7 +19,7 @@
  *      - Restart wake-word detection
  */
 
-#define EIDSP_QUANTIZE_FILTERBANK 0
+#define EIDSP_QUANTIZE_FILTERBANK 1
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -69,6 +69,14 @@ const char* SERVER_URL =
 #define I2S_DOUT 33
 
 #define SAMPLE_RATE 16000
+
+// INMP441 puts 24-bit audio in a 32-bit I2S slot (hardware).
+// The Edge Impulse model is INT8 weights; it still wants 16-bit PCM,
+// not 32-bit samples. >> 16 often leaves zeros (right-justified 24-bit).
+static inline int16_t inmp441_to_pcm16(int32_t s32)
+{
+    return (int16_t)(s32 >> 8);
+}
 
 
 // =====================================================
@@ -524,6 +532,29 @@ void loop()
             result.timing.classification
         );
 
+        {
+            int16_t *pcm =
+                inference.buffers[inference.buf_select ^ 1];
+            int peak = 0;
+            for (
+                unsigned int i = 0;
+                i < inference.n_samples;
+                i++
+            )
+            {
+                int a = pcm[i];
+                if (a < 0)
+                {
+                    a = -a;
+                }
+                if (a > peak)
+                {
+                    peak = a;
+                }
+            }
+            ei_printf("    PCM peak: %d\n", peak);
+        }
+
 
         // =================================================
         // FIND ARISE CONFIDENCE
@@ -807,8 +838,7 @@ static void capture_samples(
             sizeof(int32_t);
 
 
-        // Convert 32-bit INMP441 samples
-        // to 16-bit PCM
+        // 32-bit I2S slot → 16-bit PCM for the INT8 keyword model
         for (
             int i = 0;
             i < samples_read;
@@ -816,8 +846,8 @@ static void capture_samples(
         )
         {
             sampleBuffer[i] =
-                (int16_t)(
-                    rawBuffer[i] >> 16
+                inmp441_to_pcm16(
+                    rawBuffer[i]
                 );
         }
 
@@ -1047,8 +1077,8 @@ static int i2s_init(
         .sample_rate =
             sampling_rate,
 
-        // IMPORTANT:
-        // INMP441 is read as 32-bit I2S
+        // Slot width is 32-bit because INMP441 is I2S 24-in-32.
+        // We convert to 16-bit PCM before the INT8 model.
         .bits_per_sample =
             I2S_BITS_PER_SAMPLE_32BIT,
 
@@ -1056,7 +1086,11 @@ static int i2s_init(
             I2S_CHANNEL_FMT_ONLY_LEFT,
 
         .communication_format =
+#if defined(I2S_COMM_FORMAT_STAND_I2S)
+            (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S,
+#else
             I2S_COMM_FORMAT_I2S,
+#endif
 
         .intr_alloc_flags =
             ESP_INTR_FLAG_LEVEL1,
@@ -1496,7 +1530,7 @@ bool streamSpeechToServer()
             i++
         )
         {
-            int16_t sample = (int16_t)(rawBuffer[i] >> 16);
+            int16_t sample = inmp441_to_pcm16(rawBuffer[i]);
             pcmChunk[chunkCount++] = sample;
             samplesRecorded++;
             sumSquares += (int32_t)sample * (int32_t)sample;
