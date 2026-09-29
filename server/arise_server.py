@@ -5,10 +5,13 @@ import wave
 import socket
 import struct
 import threading
+import io
+import base64
 from collections import deque
 from datetime import datetime
 
 import numpy as np
+from PIL import Image
 
 
 # =====================================================
@@ -42,11 +45,14 @@ whisper_lock = threading.Lock()
 RAM_BUDGET_KB = 256
 CPU_BUDGET_PERCENT = 10
 MODEL_SIZE_KB = 94  # update to your actual exported model size
+WAKE_THRESHOLD = 0.80  # must match firmware WAKE_THRESHOLD
 
 STREAM_HOST = "0.0.0.0"
 STREAM_PORT = 5002
 STREAM_RECV_CHUNK = 2048
 WAVEFORM_POINTS = 400
+STREAM_TAG_WAKE = 0x01
+STREAM_TAG_COMMAND = 0x02
 
 
 # =====================================================
@@ -69,10 +75,14 @@ next_id = 1
 device_connected = False
 last_seen_ts = 0
 DEVICE_TIMEOUT_SEC = 15
+first_connected_ts = None
+disconnect_count = 0
+was_connected = False
 
 stream_active = False
 waveform_lock = threading.Lock()
 waveform_samples = deque([0.0] * WAVEFORM_POINTS, maxlen=WAVEFORM_POINTS)
+latest_wake_window = None
 
 
 def device_is_connected():
@@ -82,8 +92,20 @@ def device_is_connected():
 def mark_device_seen():
     global device_connected
     global last_seen_ts
+    global first_connected_ts
     device_connected = True
     last_seen_ts = time.time()
+    if first_connected_ts is None:
+        first_connected_ts = time.time()
+
+
+def update_disconnect_count(currently_connected):
+    """Increment only on a True -> False transition, not every poll."""
+    global was_connected
+    global disconnect_count
+    if was_connected and not currently_connected:
+        disconnect_count += 1
+    was_connected = currently_connected
 
 
 def to_number(value):
@@ -136,6 +158,89 @@ def pcm_int16_to_float32(pcm_bytes):
     audio = np.frombuffer(bytes(pcm_bytes[:usable]), dtype="<i2").astype(np.float32)
     audio /= 32768.0
     return audio
+
+
+def _hz_to_mel(hz):
+    return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+
+def _mel_to_hz(mel):
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+
+def _mel_filterbank(n_fft, n_mels, sample_rate, fmin=20.0, fmax=None):
+    if fmax is None:
+        fmax = sample_rate / 2.0
+
+    n_bins = n_fft // 2 + 1
+    mels = np.linspace(_hz_to_mel(fmin), _hz_to_mel(fmax), n_mels + 2)
+    hz = _mel_to_hz(mels)
+    bins = np.floor((n_fft + 1) * hz / sample_rate).astype(int)
+    bins = np.clip(bins, 0, n_bins - 1)
+
+    fb = np.zeros((n_mels, n_bins), dtype=np.float32)
+    for i in range(n_mels):
+        left, center, right = bins[i], bins[i + 1], bins[i + 2]
+        if center > left:
+            fb[i, left:center] = (
+                np.arange(left, center) - left
+            ) / float(center - left)
+        if right > center:
+            fb[i, center:right] = (
+                right - np.arange(center, right)
+            ) / float(right - center)
+    return fb
+
+
+def compute_mel_spectrogram_png(int16_pcm, sample_rate=16000):
+    """Return a compact log-mel PNG data URI, or None if audio is empty."""
+    if int16_pcm is None:
+        return None
+
+    pcm = np.asarray(int16_pcm, dtype=np.int16).reshape(-1)
+    if pcm.size < 256:
+        return None
+
+    audio = pcm.astype(np.float32) / 32768.0
+    n_fft = 512
+    hop = 160
+    n_mels = 40
+    window = np.hanning(n_fft).astype(np.float32)
+
+    frames = []
+    if audio.size < n_fft:
+        padded = np.zeros(n_fft, dtype=np.float32)
+        padded[:audio.size] = audio
+        frames.append(padded * window)
+    else:
+        for start in range(0, audio.size - n_fft + 1, hop):
+            frames.append(audio[start:start + n_fft] * window)
+
+    spec = np.stack(frames, axis=1)
+    power = np.abs(np.fft.rfft(spec, n=n_fft, axis=0)) ** 2
+    fb = _mel_filterbank(n_fft, n_mels, sample_rate)
+    mel = np.dot(fb, power)
+    log_mel = 10.0 * np.log10(mel + 1e-10)
+
+    lo = np.percentile(log_mel, 5)
+    hi = np.percentile(log_mel, 99)
+    if hi <= lo:
+        hi = lo + 1.0
+    norm = np.clip((log_mel - lo) / (hi - lo), 0.0, 1.0)
+    norm = np.flipud(norm)
+
+    r = np.clip(1.4 * norm, 0, 1)
+    g = np.clip(1.6 * norm - 0.35, 0, 1)
+    b = np.clip(1.15 - 0.85 * norm, 0, 1)
+    rgb = np.stack([r, g, b], axis=-1)
+    rgb = (rgb * 255).astype(np.uint8)
+
+    img = Image.fromarray(rgb, mode="RGB")
+    img = img.resize((320, 120), Image.NEAREST)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def push_waveform_pcm(pcm_bytes):
@@ -219,29 +324,46 @@ def log_detection(
     cpu_percent,
     stream_start_latency_ms,
     utterance_duration_ms,
-    transcript
+    transcript,
+    confidence=None,
+    command_pcm=None
 ):
     global next_id
     global latest_ram_kb
     global latest_cpu_percent
     global latest_latency_ms
+    global latest_wake_window
 
     latest_ram_kb = ram_kb
     latest_cpu_percent = cpu_percent
     latest_latency_ms = stream_start_latency_ms
 
+    ram_n = to_number(ram_kb) or 0
+    cpu_n = to_number(cpu_percent) or 0
+    conf_n = to_number(confidence)
+    within_budget = (ram_n <= RAM_BUDGET_KB) and (cpu_n <= CPU_BUDGET_PERCENT)
+
+    wake_png = compute_mel_spectrogram_png(latest_wake_window)
+    command_png = compute_mel_spectrogram_png(command_pcm)
+
     detections.append({
         "id": next_id,
         "time": datetime.now().strftime("%H:%M:%S"),
-        "ram_kb": to_number(ram_kb) or 0,
-        "cpu_percent": to_number(cpu_percent) or 0,
+        "ram_kb": ram_n,
+        "cpu_percent": cpu_n,
         "latency_ms": to_number(stream_start_latency_ms) or 0,
         "stream_start_latency_ms": to_number(stream_start_latency_ms) or 0,
         "utterance_duration_ms": to_number(utterance_duration_ms) or 0,
+        "confidence": round(conf_n, 2) if conf_n is not None else None,
+        "within_budget": within_budget,
+        "wake_spectrogram_png": wake_png,
+        "command_spectrogram_png": command_png,
+        "wake_window_samples": int(np.asarray(latest_wake_window).size) if latest_wake_window is not None else 0,
         "transcript": transcript,
         "status": "pending",
     })
     next_id += 1
+    latest_wake_window = None
 
 
 def recv_exact(conn, nbytes):
@@ -254,88 +376,149 @@ def recv_exact(conn, nbytes):
     return bytes(buf)
 
 
-def handle_stream_client(conn, addr):
+def handle_wake_window(conn):
+    global latest_wake_window
+
+    count_bytes = recv_exact(conn, 4)
+    if count_bytes is None:
+        print("Wake window missing sample count.")
+        return
+
+    n_samples = struct.unpack("<I", count_bytes)[0]
+    raw = recv_exact(conn, n_samples * 2)
+    if raw is None:
+        print("Wake window truncated. expected samples:", n_samples)
+        return
+
+    latest_wake_window = np.frombuffer(raw, dtype="<i2").copy()
+    print()
+    print("=" * 60)
+    print("WAKE WINDOW RECEIVED")
+    print("=" * 60)
+    print("Samples:", latest_wake_window.size)
+    print("Duration ms:", round(latest_wake_window.size / 16000.0 * 1000.0, 1))
+
+
+def handle_command_stream(conn, addr):
     global stream_active
     global latest_text
 
     stream_start_ts = time.time()
     first_byte_ts = None
-    mark_device_seen()
     stream_active = True
 
     print()
     print("=" * 60)
-    print("TCP STREAM FROM", addr)
+    print("COMMAND STREAM FROM", addr)
     print("=" * 60)
 
-    try:
-        header = recv_exact(conn, 16)
-        if header is None or len(header) < 16:
-            print("Stream ended before format header.")
-            return
+    header = recv_exact(conn, 18)
+    if header is None or len(header) < 18:
+        print("Stream ended before format header.")
+        return
 
-        sample_rate, bits, channels, ram_kb, cpu_x10, stream_latency_ms = struct.unpack(
-            "<IHHHHI",
-            header
-        )
+    (
+        sample_rate,
+        bits,
+        channels,
+        ram_kb,
+        cpu_x10,
+        stream_latency_ms,
+        confidence_x100,
+    ) = struct.unpack("<IHHHHIH", header)
 
-        cpu_percent = cpu_x10 / 10.0
+    cpu_percent = cpu_x10 / 10.0
+    confidence = confidence_x100 / 100.0
 
-        print(
-            "Format: %d Hz, %d-bit, %d ch | RAM %s KB | CPU %s%% | wake-to-stream %s ms"
-            % (sample_rate, bits, channels, ram_kb, cpu_percent, stream_latency_ms)
-        )
-
-        pcm = bytearray()
-        pending = bytearray()
-
-        while True:
-            data = conn.recv(STREAM_RECV_CHUNK)
-            if not data:
-                break
-
-            if first_byte_ts is None:
-                first_byte_ts = time.time()
-                print(
-                    "First audio byte after accept: %.1f ms"
-                    % ((first_byte_ts - stream_start_ts) * 1000.0)
-                )
-
-            mark_device_seen()
-            pending.extend(data)
-            usable = len(pending) - (len(pending) % 2)
-            if usable:
-                chunk = bytes(pending[:usable])
-                pcm.extend(chunk)
-                push_waveform_pcm(chunk)
-                del pending[:usable]
-
-        utterance_duration_ms = 0
-        if sample_rate > 0:
-            utterance_duration_ms = round(
-                (len(pcm) / 2) / float(sample_rate) * 1000.0,
-                1
-            )
-
-        print("Stream closed. PCM bytes:", len(pcm))
-        print("Utterance duration (informational):", utterance_duration_ms, "ms")
-        print("Running Whisper speech recognition...")
-
-        audio = pcm_int16_to_float32(pcm)
-        text, info = transcribe_float32(audio)
-
-        log_detection(
+    print(
+        "Format: %d Hz, %d-bit, %d ch | RAM %s KB | CPU %s%% | "
+        "wake-to-stream %s ms | confidence %.2f%%"
+        % (
+            sample_rate,
+            bits,
+            channels,
             ram_kb,
             cpu_percent,
             stream_latency_ms,
-            utterance_duration_ms,
-            text
+            confidence,
         )
+    )
+
+    pcm = bytearray()
+    pending = bytearray()
+
+    while True:
+        data = conn.recv(STREAM_RECV_CHUNK)
+        if not data:
+            break
+
+        if first_byte_ts is None:
+            first_byte_ts = time.time()
+            print(
+                "First audio byte after accept: %.1f ms"
+                % ((first_byte_ts - stream_start_ts) * 1000.0)
+            )
+
+        mark_device_seen()
+        pending.extend(data)
+        usable = len(pending) - (len(pending) % 2)
+        if usable:
+            chunk = bytes(pending[:usable])
+            pcm.extend(chunk)
+            push_waveform_pcm(chunk)
+            del pending[:usable]
+
+    utterance_duration_ms = 0
+    if sample_rate > 0:
+        utterance_duration_ms = round(
+            (len(pcm) / 2) / float(sample_rate) * 1000.0,
+            1
+        )
+
+    print("Stream closed. PCM bytes:", len(pcm))
+    print("Utterance duration (informational):", utterance_duration_ms, "ms")
+    print("Running Whisper speech recognition...")
+
+    audio = pcm_int16_to_float32(pcm)
+    text, info = transcribe_float32(audio)
+    command_pcm = np.frombuffer(bytes(pcm), dtype="<i2").copy() if len(pcm) >= 2 else None
+
+    log_detection(
+        ram_kb,
+        cpu_percent,
+        stream_latency_ms,
+        utterance_duration_ms,
+        text,
+        confidence,
+        command_pcm
+    )
+
+
+def handle_stream_client(conn, addr):
+    global stream_active
+    global latest_text
+
+    mark_device_seen()
+
+    try:
+        tag_b = recv_exact(conn, 1)
+        if tag_b is None:
+            print("Empty TCP connection.")
+            return
+
+        tag = tag_b[0]
+
+        if tag == STREAM_TAG_WAKE:
+            handle_wake_window(conn)
+        elif tag == STREAM_TAG_COMMAND:
+            handle_command_stream(conn, addr)
+        else:
+            print("Unknown stream tag:", tag)
 
     except Exception as e:
         print("Stream handler error:", str(e))
         latest_text = "Speech recognition error: " + str(e)
-        log_detection(0, 0, 0, 0, latest_text)
+        log_detection(0, 0, 0, 0, latest_text, None, None)
 
     finally:
         stream_active = False
@@ -414,6 +597,54 @@ body {
 .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
 .dot.on { background: var(--success); }
+.status-meta { font-size: 12px; color: var(--text-secondary); }
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-family: -apple-system, sans-serif;
+}
+.badge.ok { background: #052e1a; color: var(--success); }
+.badge.bad { background: #3a0d0d; color: var(--danger); }
+.conf-ok { color: var(--success); }
+.conf-warn { color: #fbbf24; }
+.conf-bad { color: var(--danger); }
+#trend-canvas {
+  width: 100%;
+  height: 180px;
+  display: block;
+  background: #0b1220;
+  border-radius: 6px;
+}
+.spec-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.spec-tile img {
+  width: 100%;
+  height: 120px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #0b1220;
+  display: block;
+}
+.spec-placeholder {
+  height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+  padding: 12px;
+  background: #0b1220;
+  border-radius: 6px;
+}
+@media (max-width: 800px) {
+  .spec-grid { grid-template-columns: 1fr; }
+}
 .section-label {
   font-size: 12px;
   text-transform: uppercase;
@@ -480,7 +711,10 @@ button.mark:hover { border-color: var(--accent); color: var(--accent); }
     <div class="logo">EDGE<span>WAKE</span></div>
     <div class="status">
       <div class="dot" id="conn-dot"></div>
-      <span id="conn-text">Checking...</span>
+      <div>
+        <div id="conn-text">Checking...</div>
+        <div class="status-meta" id="uptime-text"></div>
+      </div>
     </div>
   </div>
 
@@ -488,6 +722,20 @@ button.mark:hover { border-color: var(--accent); color: var(--accent); }
   <div class="card">
     <canvas id="wave-canvas" width="1000" height="140"></canvas>
     <div class="sub" id="wave-status" style="margin-top:10px">Waiting for stream...</div>
+  </div>
+
+  <div class="section-label">Feature Extraction</div>
+  <div class="spec-grid">
+    <div class="card spec-tile">
+      <div class="label">Wake-Word Window (what triggered detection)</div>
+      <img id="wake-spec" alt="Wake-word window spectrogram" style="display:none">
+      <div class="spec-placeholder" id="wake-spec-placeholder">no wake-word window captured for this detection</div>
+    </div>
+    <div class="card spec-tile">
+      <div class="label">Command Audio (what's being transcribed)</div>
+      <img id="cmd-spec" alt="Command audio spectrogram" style="display:none">
+      <div class="spec-placeholder" id="cmd-spec-placeholder">Waiting for command audio...</div>
+    </div>
   </div>
 
   <div class="section-label">Efficiency</div>
@@ -507,6 +755,11 @@ button.mark:hover { border-color: var(--accent); color: var(--accent); }
       <div class="value">{{ model_size }} KB</div>
       <div class="sub">static, exported model</div>
     </div>
+    <div class="card">
+      <div class="label">Budget</div>
+      <div class="value" id="budget-latest">--</div>
+      <div class="sub" id="budget-session">-- detections within budget</div>
+    </div>
   </div>
 
   <div class="section-label">Accuracy</div>
@@ -523,6 +776,12 @@ button.mark:hover { border-color: var(--accent); color: var(--accent); }
       <div class="label">Total detections</div>
       <div class="value" id="total-count">0</div>
     </div>
+  </div>
+
+  <div class="section-label">Trend</div>
+  <div class="card">
+    <canvas id="trend-canvas" width="1000" height="180"></canvas>
+    <div class="sub" id="trend-status" style="margin-top:10px">Need at least 2 detections</div>
   </div>
 
   <div class="section-label">Timing</div>
@@ -551,14 +810,16 @@ button.mark:hover { border-color: var(--accent); color: var(--accent); }
           <th>Time</th>
           <th>RAM</th>
           <th>CPU</th>
+          <th>Budget</th>
           <th>Wake-to-stream</th>
           <th>Duration</th>
+          <th>Confidence</th>
           <th>Transcript</th>
           <th>Result</th>
         </tr>
       </thead>
       <tbody id="log-body">
-        <tr><td colspan="7" class="empty">Waiting for first detection...</td></tr>
+        <tr><td colspan="9" class="empty">Waiting for first detection...</td></tr>
       </tbody>
     </table>
   </div>
@@ -569,6 +830,87 @@ button.mark:hover { border-color: var(--accent); color: var(--accent); }
 </div>
 
 <script>
+const WAKE_THRESHOLD_PERCENT = {{ wake_threshold_percent }};
+
+function formatUptime(sec) {
+  if (sec == null) return 'waiting for first connection';
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) {
+    return String(h) + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  }
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+function budgetBadge(ok) {
+  if (ok) return '<span class="badge ok">OK</span>';
+  return '<span class="badge bad">OVER</span>';
+}
+
+function confidenceClass(conf) {
+  if (conf == null) return '';
+  if (conf < WAKE_THRESHOLD_PERCENT) return 'conf-bad';
+  if (conf < WAKE_THRESHOLD_PERCENT + 5) return 'conf-warn';
+  return 'conf-ok';
+}
+
+function drawTrend(log) {
+  const canvas = document.getElementById('trend-canvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const status = document.getElementById('trend-status');
+
+  ctx.fillStyle = '#0b1220';
+  ctx.fillRect(0, 0, w, h);
+
+  const rows = (log || []).slice().reverse();
+  if (rows.length < 2) {
+    status.textContent = 'Need at least 2 detections';
+    ctx.fillStyle = '#9ca3af';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('Waiting for more detections…', 24, h / 2);
+    return;
+  }
+
+  status.textContent = 'Confidence (green) · RAM % of budget (cyan) · CPU % of budget (amber)';
+
+  const confs = rows.map(function(r) { return r.confidence != null ? r.confidence : null; });
+  const rams = rows.map(function(r) { return Math.min(100, (r.ram_kb / {{ ram_budget }}) * 100); });
+  const cpus = rows.map(function(r) { return Math.min(100, (r.cpu_percent / {{ cpu_budget }}) * 100); });
+
+  function xAt(i) { return 40 + (i / (rows.length - 1)) * (w - 60); }
+  function yAt(pct) { return h - 24 - (pct / 100) * (h - 40); }
+
+  ctx.strokeStyle = '#1f2937';
+  ctx.beginPath();
+  ctx.moveTo(40, 16);
+  ctx.lineTo(40, h - 24);
+  ctx.lineTo(w - 16, h - 24);
+  ctx.stroke();
+
+  function strokeSeries(values, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < values.length; i++) {
+      if (values[i] == null) continue;
+      const x = xAt(i);
+      const y = yAt(values[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    if (started) ctx.stroke();
+  }
+
+  strokeSeries(rams, '#22d3ee');
+  strokeSeries(cpus, '#fbbf24');
+  strokeSeries(confs, '#4ade80');
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/data');
@@ -576,6 +918,9 @@ async function refresh() {
 
     document.getElementById('conn-dot').className = 'dot' + (data.connected ? ' on' : '');
     document.getElementById('conn-text').textContent = data.connected ? 'Device connected' : 'Device disconnected';
+    document.getElementById('uptime-text').textContent =
+      'Connected for ' + formatUptime(data.uptime_sec) +
+      ' · ' + (data.disconnect_count || 0) + ' disconnects this session';
 
     if (data.latest) {
       const ramPct = Math.min(100, (data.latest.ram_kb / {{ ram_budget }}) * 100);
@@ -594,7 +939,37 @@ async function refresh() {
       document.getElementById('last-latency').textContent = wakeMs + ' ms';
       document.getElementById('utterance-duration').textContent = durMs + (durMs === '--' ? '' : ' ms');
       document.getElementById('transcript-box').textContent = data.latest.transcript || 'Could not recognize speech.';
+      document.getElementById('budget-latest').innerHTML = budgetBadge(!!data.latest.within_budget);
+
+      const wakeImg = document.getElementById('wake-spec');
+      const wakePh = document.getElementById('wake-spec-placeholder');
+      if (data.latest.wake_spectrogram_png) {
+        wakeImg.src = data.latest.wake_spectrogram_png;
+        wakeImg.style.display = 'block';
+        wakePh.style.display = 'none';
+      } else {
+        wakeImg.removeAttribute('src');
+        wakeImg.style.display = 'none';
+        wakePh.style.display = 'flex';
+      }
+
+      const cmdImg = document.getElementById('cmd-spec');
+      const cmdPh = document.getElementById('cmd-spec-placeholder');
+      if (data.latest.command_spectrogram_png) {
+        cmdImg.src = data.latest.command_spectrogram_png;
+        cmdImg.style.display = 'block';
+        cmdPh.style.display = 'none';
+      } else {
+        cmdImg.removeAttribute('src');
+        cmdImg.style.display = 'none';
+        cmdPh.style.display = 'flex';
+      }
     }
+
+    const allRows = data.log || [];
+    const inBudget = allRows.filter(function(r) { return r.within_budget; }).length;
+    document.getElementById('budget-session').textContent =
+      inBudget + '/' + allRows.length + ' detections within budget';
 
     document.getElementById('total-count').textContent = data.total;
     document.getElementById('fp-count').textContent = data.false_positives;
@@ -602,10 +977,10 @@ async function refresh() {
     document.getElementById('avg-latency').textContent = data.avg_latency === null ? '-- ms' : data.avg_latency + ' ms';
 
     const tbody = document.getElementById('log-body');
-    if (data.log.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">Waiting for first detection...</td></tr>';
+    if (allRows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">Waiting for first detection...</td></tr>';
     } else {
-      tbody.innerHTML = data.log.map(function(row) {
+      tbody.innerHTML = allRows.map(function(row) {
         let tag;
         if (row.status === 'true_positive') tag = '<span class="tag tp">True positive</span>';
         else if (row.status === 'false_activation') tag = '<span class="tag fp">False activation</span>';
@@ -613,18 +988,24 @@ async function refresh() {
 
         const wake = row.stream_start_latency_ms != null ? row.stream_start_latency_ms : row.latency_ms;
         const dur = row.utterance_duration_ms != null ? row.utterance_duration_ms : '--';
+        const conf = row.confidence != null ? Number(row.confidence).toFixed(1) + '%' : '--';
+        const confCls = confidenceClass(row.confidence);
 
         return '<tr>' +
           '<td>' + row.time + '</td>' +
           '<td>' + row.ram_kb + ' KB</td>' +
           '<td>' + row.cpu_percent + '%</td>' +
+          '<td>' + budgetBadge(!!row.within_budget) + '</td>' +
           '<td>' + wake + ' ms</td>' +
           '<td>' + dur + ' ms</td>' +
+          '<td class="' + confCls + '">' + conf + '</td>' +
           '<td>' + (row.transcript ? row.transcript.slice(0, 40) : '--') + '</td>' +
           '<td>' + tag + '</td>' +
           '</tr>';
       }).join('');
     }
+
+    drawTrend(allRows);
   } catch (e) {
     console.error(e);
   }
@@ -696,7 +1077,8 @@ def home():
         DASHBOARD_HTML,
         ram_budget=RAM_BUDGET_KB,
         cpu_budget=CPU_BUDGET_PERCENT,
-        model_size=MODEL_SIZE_KB
+        model_size=MODEL_SIZE_KB,
+        wake_threshold_percent=round(WAKE_THRESHOLD * 100, 2)
     )
 
 
@@ -722,15 +1104,31 @@ def api_data():
     avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else None
 
     latest = detections[-1] if detections else None
+    log_rows = []
+    for d in reversed(detections[-20:]):
+        row = dict(d)
+        row["wake_spectrogram_png"] = None
+        row["command_spectrogram_png"] = None
+        log_rows.append(row)
+
+    connected = device_is_connected() or stream_active
+    update_disconnect_count(connected)
+
+    uptime_sec = None
+    if first_connected_ts is not None:
+        uptime_sec = round(time.time() - first_connected_ts, 1)
 
     return jsonify({
-        "connected": device_is_connected() or stream_active,
+        "connected": connected,
+        "uptime_sec": uptime_sec,
+        "disconnect_count": disconnect_count,
+        "wake_threshold_percent": round(WAKE_THRESHOLD * 100, 2),
         "total": total,
         "false_positives": false_positives,
         "tp_rate": tp_rate,
         "avg_latency": avg_latency,
         "latest": latest,
-        "log": list(reversed(detections[-20:])),
+        "log": log_rows,
     })
 
 
@@ -780,6 +1178,7 @@ def receive_audio():
     ram_kb = request.headers.get("X-Device-RAM-KB", "—")
     cpu_percent = request.headers.get("X-Device-CPU-Percent", "—")
     latency_ms = request.headers.get("X-Detection-Latency-MS", "—")
+    confidence = request.headers.get("X-Wake-Confidence", None)
 
     print()
     print("=" * 60)
@@ -838,12 +1237,18 @@ def receive_audio():
         }
         status_code = 500
 
+    command_pcm = None
+    if len(request.data) > 44:
+        command_pcm = np.frombuffer(request.data[44:], dtype="<i2")
+
     log_detection(
         ram_kb,
         cpu_percent,
         latency_ms,
         utterance_duration_ms,
-        latest_text
+        latest_text,
+        confidence,
+        command_pcm
     )
 
     return jsonify(response_payload), status_code

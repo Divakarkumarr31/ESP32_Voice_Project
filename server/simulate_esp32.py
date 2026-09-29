@@ -2,7 +2,7 @@
 EdgeWake ESP32 simulator — live TCP PCM stream.
 
 Opens a socket to STREAM_PORT as soon as you press Enter (wake word),
-sends a 16-byte header, then streams laptop-mic chunks while you speak.
+sends an 18-byte header, then streams laptop-mic chunks while you speak.
 VAD closes the socket the same way the firmware does.
 
 The old HTTP POST /audio path remains on the server as a fallback.
@@ -40,6 +40,11 @@ CHUNK_SAMPLES = 512
 FAKE_RAM_USED_RANGE = (40, 90)
 FAKE_CPU_RANGE = (3.0, 8.5)
 
+STREAM_TAG_WAKE = 0x01
+STREAM_TAG_COMMAND = 0x02
+# Typical EI window at 16 kHz is ~1 s; firmware sends the real count.
+WAKE_WINDOW_SAMPLES = 16000
+
 
 def send_all(sock, data):
     view = memoryview(data)
@@ -50,8 +55,33 @@ def send_all(sock, data):
         view = view[sent:]
 
 
+def send_wake_window():
+    print(">>> Capturing wake-word window (~1 s)...")
+    rec = sd.rec(
+        WAKE_WINDOW_SAMPLES,
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+    )
+    sd.wait()
+    rec = np.ascontiguousarray(rec.flatten(), dtype=np.int16)
+
+    sock = socket.create_connection((STREAM_HOST, STREAM_PORT), timeout=5)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        send_all(sock, bytes([STREAM_TAG_WAKE]))
+        send_all(sock, struct.pack("<I", int(rec.size)))
+        send_all(sock, rec.tobytes())
+    finally:
+        sock.close()
+
+    print(">>> Wake window sent (%d samples)" % rec.size)
+
+
 def stream_speech(keyword_end_ts):
-    print("\n>>> Opening TCP stream...")
+    send_wake_window()
+
+    print("\n>>> Opening command TCP stream...")
 
     sock = socket.create_connection((STREAM_HOST, STREAM_PORT), timeout=5)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -60,21 +90,25 @@ def stream_speech(keyword_end_ts):
     fake_ram_used = int(round(random.uniform(*FAKE_RAM_USED_RANGE)))
     fake_cpu = round(random.uniform(*FAKE_CPU_RANGE), 1)
     cpu_x10 = int(round(fake_cpu * 10))
+    confidence = round(random.uniform(82.0, 99.5), 2)
+    confidence_x100 = int(round(confidence * 100))
 
     header = struct.pack(
-        "<IHHHHI",
+        "<IHHHHIH",
         SAMPLE_RATE,
         BITS_PER_SAMPLE,
         CHANNELS,
         fake_ram_used,
         cpu_x10,
         int(stream_start_latency_ms),
+        confidence_x100,
     )
+    send_all(sock, bytes([STREAM_TAG_COMMAND]))
     send_all(sock, header)
 
     print(
-        ">>> Stream open  (wake-to-stream %.1f ms, RAM %dKB, CPU %.1f%%)"
-        % (stream_start_latency_ms, fake_ram_used, fake_cpu)
+        ">>> Stream open  (wake-to-stream %.1f ms, RAM %dKB, CPU %.1f%%, conf %.2f%%)"
+        % (stream_start_latency_ms, fake_ram_used, fake_cpu, confidence)
     )
     print(">>> Speak now...")
 

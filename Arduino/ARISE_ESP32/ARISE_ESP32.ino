@@ -147,6 +147,18 @@ static uint32_t lastFreeHeapBytes = 0;
 
 static unsigned long keywordEndMs = 0;
 
+static float lastAriseConfidence = 0.0f;
+
+#define STREAM_TAG_WAKE 0x01
+#define STREAM_TAG_COMMAND 0x02
+
+#define WAKE_WINDOW_SAMPLES \
+    (EI_CLASSIFIER_SLICE_SIZE * EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)
+
+static int16_t wakeWindowRing[WAKE_WINDOW_SAMPLES];
+static uint32_t wakeWindowWritePos = 0;
+static int16_t wakeWindowSnapshot[WAKE_WINDOW_SAMPLES];
+
 
 // =====================================================
 // FUNCTION DECLARATIONS
@@ -183,6 +195,10 @@ static int i2s_deinit();
 bool recordSpeechAndSend();
 
 bool streamSpeechToServer();
+
+bool sendWakeWindowToServer();
+
+void snapshotWakeWindow();
 
 static bool writeAll(
     WiFiClient &client,
@@ -355,6 +371,12 @@ void setup()
 
     ei_printf(
         "Say ARISE to test the model.\n"
+    );
+
+    ei_printf(
+        "Wake window samples: %d (%.0f ms)\n",
+        WAKE_WINDOW_SAMPLES,
+        (WAKE_WINDOW_SAMPLES * 1000.0f) / SAMPLE_RATE
     );
 }
 
@@ -542,6 +564,14 @@ void loop()
 
             // Keyword-end reference for latency (before LED / VAD / upload).
             keywordEndMs = millis();
+            lastAriseConfidence = ariseConfidence;
+
+            snapshotWakeWindow();
+
+            ei_printf(
+                "Wake window snapshot: %d samples\n",
+                WAKE_WINDOW_SAMPLES
+            );
 
             ei_printf(
                 "\n================================\n"
@@ -594,10 +624,7 @@ void loop()
                 "LED OFF\n"
             );
 
-
-            // =================================================
-            // RECORD SPEECH AND SEND
-            // =================================================
+            sendWakeWindowToServer();
 
             bool success =
                 streamSpeechToServer();
@@ -713,6 +740,13 @@ static void audio_inference_callback(
             inference.buf_count++
         ] =
             sampleBuffer[i];
+
+        wakeWindowRing[wakeWindowWritePos] = sampleBuffer[i];
+        wakeWindowWritePos++;
+        if (wakeWindowWritePos >= (uint32_t)WAKE_WINDOW_SAMPLES)
+        {
+            wakeWindowWritePos = 0;
+        }
 
 
         if (
@@ -1232,16 +1266,90 @@ static bool writeAll(
 }
 
 
-// =====================================================
-// STREAM SPEECH TO SERVER OVER RAW TCP
+void snapshotWakeWindow()
+{
+    uint32_t pos = wakeWindowWritePos;
+
+    for (uint32_t i = 0; i < (uint32_t)WAKE_WINDOW_SAMPLES; i++)
+    {
+        wakeWindowSnapshot[i] = wakeWindowRing[pos];
+        pos++;
+        if (pos >= (uint32_t)WAKE_WINDOW_SAMPLES)
+        {
+            pos = 0;
+        }
+    }
+}
+
+
+bool sendWakeWindowToServer()
+{
+    Serial.println();
+    Serial.println("Sending wake-word window...");
+    Serial.print("WAKE_WINDOW_SAMPLES=");
+    Serial.println(WAKE_WINDOW_SAMPLES);
+    logFreeHeap();
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        connectWiFi();
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("ERROR: No Wi-Fi for wake window.");
+        return false;
+    }
+
+    WiFiClient client;
+    client.setNoDelay(true);
+
+    if (!client.connect(SERVER_HOST, STREAM_PORT))
+    {
+        Serial.println("ERROR: Could not connect for wake window.");
+        return false;
+    }
+
+    uint8_t tag = STREAM_TAG_WAKE;
+    uint32_t count = (uint32_t)WAKE_WINDOW_SAMPLES;
+
+    if (!writeAll(client, &tag, 1))
+    {
+        client.stop();
+        return false;
+    }
+
+    if (!writeAll(client, (const uint8_t *)&count, 4))
+    {
+        client.stop();
+        return false;
+    }
+
+    if (!writeAll(
+            client,
+            (const uint8_t *)wakeWindowSnapshot,
+            (size_t)WAKE_WINDOW_SAMPLES * sizeof(int16_t)
+        ))
+    {
+        Serial.println("ERROR: Wake window send failed.");
+        client.stop();
+        return false;
+    }
+
+    client.stop();
+    Serial.println("Wake window sent.");
+    return true;
+}
 //
 // Protocol (little-endian):
+//   uint8  tag = 0x02 (command stream)
 //   uint32 sample_rate
 //   uint16 bits_per_sample
 //   uint16 channels
 //   uint16 ram_kb
 //   uint16 cpu_percent * 10
 //   uint32 stream_start_latency_ms
+//   uint16 confidence_x100  (ariseConfidence * 10000, 0-10000)
 //   then raw int16 PCM until TCP close (FIN)
 // =====================================================
 
@@ -1287,20 +1395,35 @@ bool streamSpeechToServer()
     Serial.print(streamStartLatencyMs);
     Serial.println(" ms");
 
+    uint8_t tag = STREAM_TAG_COMMAND;
+    if (!writeAll(client, &tag, 1))
+    {
+        Serial.println("ERROR: Command tag send failed.");
+        client.stop();
+        return false;
+    }
+
     uint32_t sampleRate = SAMPLE_RATE;
     uint16_t bitsPerSample = 16;
     uint16_t channels = 1;
     uint16_t ramKb = (uint16_t)(lastFreeHeapBytes / 1024);
     uint16_t cpuX10 = (uint16_t)(lastIdleCpuPercent * 10.0f + 0.5f);
     uint32_t latencyMs = (uint32_t)streamStartLatencyMs;
+    uint16_t confidenceX100 = (uint16_t)(
+        lastAriseConfidence * 10000.0f + 0.5f
+    );
 
-    uint8_t header[16];
+    uint8_t header[18];
     memcpy(header + 0, &sampleRate, 4);
     memcpy(header + 4, &bitsPerSample, 2);
     memcpy(header + 6, &channels, 2);
     memcpy(header + 8, &ramKb, 2);
     memcpy(header + 10, &cpuX10, 2);
     memcpy(header + 12, &latencyMs, 4);
+    memcpy(header + 16, &confidenceX100, 2);
+
+    Serial.print("Wake confidence x100: ");
+    Serial.println(confidenceX100);
 
     if (!writeAll(client, header, sizeof(header)))
     {
