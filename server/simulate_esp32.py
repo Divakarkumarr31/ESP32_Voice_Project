@@ -1,154 +1,148 @@
 """
-EdgeWake ESP32 simulator.
+EdgeWake ESP32 simulator — live TCP PCM stream.
 
-Simulates the ESP32 device without any hardware, so you can test
-the Flask server + dashboard end-to-end using your laptop mic.
+Opens a socket to STREAM_PORT as soon as you press Enter (wake word),
+sends a 16-byte header, then streams laptop-mic chunks while you speak.
+VAD closes the socket the same way the firmware does.
 
-Each time you press Enter, it pretends the wake word was just
-detected: it records your speech (stopping automatically after
-silence, same VAD idea as the real firmware), builds a WAV file,
-attaches fake-but-plausible RAM/CPU/latency headers, and POSTs it
-to /audio exactly like the ESP32 does.
-
-Install dependencies first:
-    pip install sounddevice numpy requests
+The old HTTP POST /audio path remains on the server as a fallback.
+This script uses the new TCP protocol by default.
 
 Run (with arise_server.py already running):
     python simulate_esp32.py
 """
 
-import io
+import socket
+import struct
 import time
-import wave
 import random
 
 import numpy as np
 import sounddevice as sd
-import requests
 
 # =====================================================
 # CONFIG
 # =====================================================
 
-SERVER_URL = "http://127.0.0.1:5001/audio"
+STREAM_HOST = "127.0.0.1"
+STREAM_PORT = 5002
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
+BITS_PER_SAMPLE = 16
 
-SILENCE_THRESHOLD = 500       # same idea as the ESP32 RMS threshold
-SILENCE_DURATION_SEC = 0.7    # stop after this much trailing silence
-MAX_RECORD_SEC = 8            # hard safety cap, same as firmware
-CHUNK_SEC = 0.05              # 50ms chunks for VAD checking
+SILENCE_THRESHOLD = 500
+SILENCE_DURATION_SEC = 0.7
+MAX_RECORD_SEC = 8
+# Match ESP32 STREAM_CHUNK_SAMPLES = 512 (~32 ms at 16 kHz)
+CHUNK_SAMPLES = 512
 
-# Fake telemetry ranges — tweak these to whatever your real
-# firmware has been logging, so the dashboard looks representative
-RAM_BUDGET_KB = 256
-FAKE_RAM_USED_RANGE = (150, 210)      # KB used, out of 256
-CPU_BUDGET_PERCENT = 10
-FAKE_CPU_RANGE = (3.0, 8.5)           # % idle CPU
+FAKE_RAM_USED_RANGE = (40, 90)
+FAKE_CPU_RANGE = (3.0, 8.5)
 
 
-def record_with_vad():
-    """Record from the mic until trailing silence or max duration."""
-    print("\n>>> Recording... speak your command now.")
+def send_all(sock, data):
+    view = memoryview(data)
+    while len(view):
+        sent = sock.send(view)
+        if sent == 0:
+            raise RuntimeError("socket closed while sending")
+        view = view[sent:]
 
-    chunk_samples = int(SAMPLE_RATE * CHUNK_SEC)
-    max_chunks = int(MAX_RECORD_SEC / CHUNK_SEC)
-    silence_chunks_needed = int(SILENCE_DURATION_SEC / CHUNK_SEC)
 
-    recorded = []
+def stream_speech(keyword_end_ts):
+    print("\n>>> Opening TCP stream...")
+
+    sock = socket.create_connection((STREAM_HOST, STREAM_PORT), timeout=5)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    stream_start_latency_ms = round((time.time() - keyword_end_ts) * 1000, 1)
+    fake_ram_used = int(round(random.uniform(*FAKE_RAM_USED_RANGE)))
+    fake_cpu = round(random.uniform(*FAKE_CPU_RANGE), 1)
+    cpu_x10 = int(round(fake_cpu * 10))
+
+    header = struct.pack(
+        "<IHHHHI",
+        SAMPLE_RATE,
+        BITS_PER_SAMPLE,
+        CHANNELS,
+        fake_ram_used,
+        cpu_x10,
+        int(stream_start_latency_ms),
+    )
+    send_all(sock, header)
+
+    print(
+        ">>> Stream open  (wake-to-stream %.1f ms, RAM %dKB, CPU %.1f%%)"
+        % (stream_start_latency_ms, fake_ram_used, fake_cpu)
+    )
+    print(">>> Speak now...")
+
+    max_chunks = int(MAX_RECORD_SEC * SAMPLE_RATE / CHUNK_SAMPLES)
+    silence_chunks_needed = int(SILENCE_DURATION_SEC * SAMPLE_RATE / CHUNK_SAMPLES)
+    min_speech_chunks = max(1, int(0.25 * SAMPLE_RATE / CHUNK_SAMPLES))
+
+    samples_sent = 0
     silence_run = 0
     heard_speech = False
+    chunks_sent = 0
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
         dtype="int16",
+        blocksize=CHUNK_SAMPLES,
     )
 
-    with stream:
-        for _ in range(max_chunks):
-            chunk, _ = stream.read(chunk_samples)
-            chunk = chunk.flatten()
-            recorded.append(chunk)
-
-            rms = np.sqrt(np.mean(chunk.astype(np.float64) ** 2))
-
-            if rms > SILENCE_THRESHOLD:
-                heard_speech = True
-                silence_run = 0
-            elif heard_speech:
-                silence_run += 1
-                if silence_run >= silence_chunks_needed:
-                    break
-
-    audio = np.concatenate(recorded) if recorded else np.array([], dtype=np.int16)
-    duration = len(audio) / SAMPLE_RATE
-    print(f">>> Stopped recording ({duration:.2f}s captured).")
-    return audio
-
-
-def audio_to_wav_bytes(audio):
-    """Pack int16 PCM samples into an in-memory WAV file."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio.tobytes())
-    return buf.getvalue()
-
-
-def send_to_server(wav_bytes, keyword_end_ts):
-    fake_ram_used = round(random.uniform(*FAKE_RAM_USED_RANGE), 1)
-    fake_cpu = round(random.uniform(*FAKE_CPU_RANGE), 1)
-    latency_ms = round((time.time() - keyword_end_ts) * 1000, 1)
-
-    headers = {
-        "Content-Type": "audio/wav",
-        "X-Device-RAM-KB": str(fake_ram_used),
-        "X-Device-CPU-Percent": str(fake_cpu),
-        "X-Detection-Latency-MS": str(latency_ms),
-    }
-
-    print(f">>> Sending to server  (RAM {fake_ram_used}KB, CPU {fake_cpu}%, latency {latency_ms}ms)")
-
     try:
-        response = requests.post(
-            SERVER_URL,
-            data=wav_bytes,
-            headers=headers,
-            timeout=60,
-        )
-        print(">>> Server response:", response.status_code, response.json())
-    except requests.exceptions.ConnectionError:
-        print("!!! Could not reach the server. Is arise_server.py running on port 5001?")
-    except Exception as e:
-        print("!!! Error sending to server:", e)
+        with stream:
+            for _ in range(max_chunks):
+                chunk, _ = stream.read(CHUNK_SAMPLES)
+                chunk = np.ascontiguousarray(chunk.flatten(), dtype=np.int16)
+                send_all(sock, chunk.tobytes())
+
+                samples_sent += chunk.size
+                chunks_sent += 1
+
+                rms = np.sqrt(np.mean(chunk.astype(np.float64) ** 2))
+
+                if rms > SILENCE_THRESHOLD:
+                    heard_speech = True
+                    silence_run = 0
+                elif heard_speech:
+                    silence_run += 1
+                    if (
+                        chunks_sent >= min_speech_chunks
+                        and silence_run >= silence_chunks_needed
+                    ):
+                        print(">>> VAD: trailing silence, closing stream.")
+                        break
+    finally:
+        sock.close()
+
+    duration_ms = round(samples_sent / SAMPLE_RATE * 1000.0, 1)
+    print(">>> Stream closed. Utterance duration: %.1f ms (not latency)" % duration_ms)
+
+    if samples_sent < SAMPLE_RATE * 0.3:
+        print("!!! Recording was short; Whisper may not have enough speech.")
 
 
 def main():
     print("=" * 60)
-    print("EDGEWAKE — ESP32 SIMULATOR (no hardware needed)")
+    print("EDGEWAKE — ESP32 STREAMING SIMULATOR")
     print("=" * 60)
-    print(f"Target server: {SERVER_URL}")
+    print("Target stream: tcp://%s:%d" % (STREAM_HOST, STREAM_PORT))
     print("Press Enter to simulate a wake-word detection, or Ctrl+C to quit.")
 
     while True:
         input("\nPress Enter to simulate 'ARISE' detected...")
-
-        # This is the moment the real ESP32 would have just
-        # confirmed the wake word — latency is measured from here.
         keyword_end_ts = time.time()
-
-        audio = record_with_vad()
-
-        if len(audio) < SAMPLE_RATE * 0.3:
-            print("!!! Recording too short, skipping send (probably no speech detected).")
-            continue
-
-        wav_bytes = audio_to_wav_bytes(audio)
-        send_to_server(wav_bytes, keyword_end_ts)
+        try:
+            stream_speech(keyword_end_ts)
+        except ConnectionRefusedError:
+            print("!!! Could not reach the stream port. Is arise_server.py running?")
+        except Exception as e:
+            print("!!! Stream error:", e)
 
 
 if __name__ == "__main__":

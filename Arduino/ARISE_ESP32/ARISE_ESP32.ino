@@ -13,8 +13,9 @@
  * 1. Continuously listen for ARISE
  * 2. If ARISE >= 0.80:
  *      - LED ON for 2 seconds
- *      - Record speech until trailing silence (VAD), max 8 seconds
- *      - Send WAV to Mac Flask server
+ *      - Open a TCP stream to the server
+ *      - Stream I2S chunks live until trailing silence (VAD), max 8 seconds
+ *      - Close the socket (TCP FIN = end of utterance)
  *      - Restart wake-word detection
  */
 
@@ -38,6 +39,10 @@
 
 const char* WIFI_SSID = "Dev-2.4g";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+const char* SERVER_HOST = "192.168.1.44";
+
+#define STREAM_PORT 5002
 
 const char* SERVER_URL =
     "http://192.168.1.44:5001/audio";
@@ -76,6 +81,9 @@ const char* SERVER_URL =
 
 #define SPEECH_SAMPLES \
     (SAMPLE_RATE * MAX_SPEECH_SECONDS)
+
+// I2S conversion scratch buffer (int16). A few KB, not 250KB.
+#define STREAM_CHUNK_SAMPLES 512
 
 // RMS below this counts as silence (tunable).
 #define SILENCE_THRESHOLD 500.0f
@@ -173,6 +181,14 @@ static int i2s_init(
 static int i2s_deinit();
 
 bool recordSpeechAndSend();
+
+bool streamSpeechToServer();
+
+static bool writeAll(
+    WiFiClient &client,
+    const uint8_t *data,
+    size_t length
+);
 
 void connectWiFi();
 
@@ -584,7 +600,7 @@ void loop()
             // =================================================
 
             bool success =
-                recordSpeechAndSend();
+                streamSpeechToServer();
 
 
             if (success)
@@ -1183,232 +1199,208 @@ void connectWiFi()
 
 
 // =====================================================
-// RECORD 5 SECONDS OF SPEECH
-// AND SEND WAV TO SERVER
+// WRITE ALL BYTES ON AN OPEN SOCKET
 // =====================================================
 
-bool recordSpeechAndSend()
+static bool writeAll(
+    WiFiClient &client,
+    const uint8_t *data,
+    size_t length
+)
+{
+    size_t remaining = length;
+
+    while (remaining > 0)
+    {
+        if (!client.connected())
+        {
+            return false;
+        }
+
+        size_t sent = client.write(data, remaining);
+
+        if (sent == 0)
+        {
+            return false;
+        }
+
+        data += sent;
+        remaining -= sent;
+    }
+
+    return true;
+}
+
+
+// =====================================================
+// STREAM SPEECH TO SERVER OVER RAW TCP
+//
+// Protocol (little-endian):
+//   uint32 sample_rate
+//   uint16 bits_per_sample
+//   uint16 channels
+//   uint16 ram_kb
+//   uint16 cpu_percent * 10
+//   uint32 stream_start_latency_ms
+//   then raw int16 PCM until TCP close (FIN)
+// =====================================================
+
+bool streamSpeechToServer()
 {
     Serial.println();
-
-    Serial.println(
-        "================================"
-    );
-
-    Serial.println(
-        "PREPARING TO RECORD SPEECH"
-    );
-
-    Serial.println(
-        "================================"
-    );
-
-
-    // =================================================
-    // STOP EDGE IMPULSE
-    // =================================================
+    Serial.println("================================");
+    Serial.println("STREAMING SPEECH TO SERVER");
+    Serial.println("================================");
 
     microphone_inference_end();
 
-
-    delay(300);
-
-
-    // =================================================
-    // ALLOCATE SPEECH BUFFER
-    // =================================================
-
-    const int totalSamples =
-        SPEECH_SAMPLES;
-
-
-    int16_t *speechBuffer =
-        (int16_t *)malloc(
-            totalSamples *
-            sizeof(int16_t)
-        );
-
-
-    if (
-        speechBuffer == NULL
-    )
-    {
-        Serial.println(
-            "ERROR: Could not allocate speech buffer."
-        );
-
-        return false;
-    }
-
-    Serial.println("Heap after speech buffer alloc:");
+    Serial.println("Heap after stopping inference (no 250KB buffer):");
     logFreeHeap();
 
-
-    // =================================================
-    // START I2S
-    // =================================================
-
-    if (
-        i2s_init(
-            SAMPLE_RATE
-        ) != 0
-    )
+    if (WiFi.status() != WL_CONNECTED)
     {
-        Serial.println(
-            "ERROR: Could not start I2S."
-        );
+        Serial.println("Wi-Fi disconnected. Reconnecting...");
+        connectWiFi();
+    }
 
-
-        free(
-            speechBuffer
-        );
-
-
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("ERROR: No Wi-Fi connection.");
         return false;
     }
 
+    WiFiClient client;
+    client.setNoDelay(true);
 
-    i2s_zero_dma_buffer(
-        I2S_PORT
-    );
+    Serial.println("Opening TCP stream...");
 
+    if (!client.connect(SERVER_HOST, STREAM_PORT))
+    {
+        Serial.println("ERROR: Could not connect to stream port.");
+        return false;
+    }
 
-    delay(100);
+    unsigned long streamStartLatencyMs =
+        millis() - keywordEndMs;
 
+    Serial.print("Wake-to-stream latency: ");
+    Serial.print(streamStartLatencyMs);
+    Serial.println(" ms");
 
-    // =================================================
-    // START RECORDING
-    // =================================================
+    uint32_t sampleRate = SAMPLE_RATE;
+    uint16_t bitsPerSample = 16;
+    uint16_t channels = 1;
+    uint16_t ramKb = (uint16_t)(lastFreeHeapBytes / 1024);
+    uint16_t cpuX10 = (uint16_t)(lastIdleCpuPercent * 10.0f + 0.5f);
+    uint32_t latencyMs = (uint32_t)streamStartLatencyMs;
+
+    uint8_t header[16];
+    memcpy(header + 0, &sampleRate, 4);
+    memcpy(header + 4, &bitsPerSample, 2);
+    memcpy(header + 6, &channels, 2);
+    memcpy(header + 8, &ramKb, 2);
+    memcpy(header + 10, &cpuX10, 2);
+    memcpy(header + 12, &latencyMs, 4);
+
+    if (!writeAll(client, header, sizeof(header)))
+    {
+        Serial.println("ERROR: Stream header send failed.");
+        client.stop();
+        return false;
+    }
+
+    if (i2s_init(SAMPLE_RATE) != 0)
+    {
+        Serial.println("ERROR: Could not start I2S.");
+        client.stop();
+        return false;
+    }
+
+    i2s_zero_dma_buffer(I2S_PORT);
 
     Serial.println();
+    Serial.println("================================");
+    Serial.println(">>> SPEAK NOW <<<");
+    Serial.println("Streaming until silence (max 8 seconds)...");
+    Serial.println("================================");
 
-    Serial.println(
-        "================================"
-    );
-
-    Serial.println(
-        ">>> SPEAK NOW <<<"
-    );
-
-    Serial.println(
-        "Recording until silence (max 8 seconds)..."
-    );
-
-    Serial.println(
-        "================================"
-    );
-
-
+    const int totalSamples = SPEECH_SAMPLES;
     int samplesRecorded = 0;
-
     uint32_t consecutiveSilenceSamples = 0;
-
     bool heardSpeech = false;
 
     const uint32_t silenceNeedSamples =
         (SAMPLE_RATE * SILENCE_DURATION_MS) / 1000;
-
     const uint32_t minSpeechSamples =
         (SAMPLE_RATE * MIN_SPEECH_MS) / 1000;
 
-    int32_t rawBuffer[512];
-
+    int32_t rawBuffer[STREAM_CHUNK_SAMPLES];
+    int16_t pcmChunk[STREAM_CHUNK_SAMPLES];
     size_t bytesRead;
-
     uint32_t lastHeapLogSamples = 0;
 
-
-    while (
-        samplesRecorded <
-        totalSamples
-    )
+    while (samplesRecorded < totalSamples)
     {
-        esp_err_t result =
-            i2s_read(
-                I2S_PORT,
-                rawBuffer,
-                sizeof(rawBuffer),
-                &bytesRead,
-                portMAX_DELAY
-            );
+        esp_err_t result = i2s_read(
+            I2S_PORT,
+            rawBuffer,
+            sizeof(rawBuffer),
+            &bytesRead,
+            portMAX_DELAY
+        );
 
-
-        if (
-            result != ESP_OK
-        )
+        if (result != ESP_OK)
         {
-            Serial.println(
-                "ERROR: I2S read failed."
-            );
-
-
+            Serial.println("ERROR: I2S read failed.");
             i2s_deinit();
-
-
-            free(
-                speechBuffer
-            );
-
-
+            client.stop();
             return false;
         }
 
-
-        int samplesRead =
-            bytesRead /
-            sizeof(int32_t);
+        int samplesRead = bytesRead / sizeof(int32_t);
 
         if (samplesRead <= 0)
         {
             continue;
         }
 
-
         int64_t sumSquares = 0;
-
         int chunkCount = 0;
-
 
         for (
             int i = 0;
-            i < samplesRead &&
-            samplesRecorded < totalSamples;
+            i < samplesRead && samplesRecorded < totalSamples;
             i++
         )
         {
-            int16_t sample =
-                (int16_t)(
-                    rawBuffer[i] >> 16
-                );
-
-            speechBuffer[
-                samplesRecorded++
-            ] = sample;
-
-            sumSquares +=
-                (int32_t)sample *
-                (int32_t)sample;
-
-            chunkCount++;
+            int16_t sample = (int16_t)(rawBuffer[i] >> 16);
+            pcmChunk[chunkCount++] = sample;
+            samplesRecorded++;
+            sumSquares += (int32_t)sample * (int32_t)sample;
         }
-
 
         if (chunkCount <= 0)
         {
             break;
         }
 
+        if (!writeAll(
+                client,
+                (const uint8_t *)pcmChunk,
+                (size_t)chunkCount * sizeof(int16_t)
+            ))
+        {
+            Serial.println("ERROR: Audio stream send failed.");
+            i2s_deinit();
+            client.stop();
+            return false;
+        }
 
-        float rms = sqrtf(
-            (float)sumSquares /
-            (float)chunkCount
-        );
-
+        float rms = sqrtf((float)sumSquares / (float)chunkCount);
 
         if (rms < SILENCE_THRESHOLD)
         {
-            consecutiveSilenceSamples +=
-                (uint32_t)chunkCount;
+            consecutiveSilenceSamples += (uint32_t)chunkCount;
         }
         else
         {
@@ -1416,546 +1408,52 @@ bool recordSpeechAndSend()
             heardSpeech = true;
         }
 
-
         if (
             heardSpeech &&
             samplesRecorded >= (int)minSpeechSamples &&
             consecutiveSilenceSamples >= silenceNeedSamples
         )
         {
-            Serial.println(
-                "VAD: trailing silence reached, stopping."
-            );
-
+            Serial.println("VAD: trailing silence reached, stopping.");
             break;
         }
 
-
-        if (
-            samplesRecorded -
-            (int)lastHeapLogSamples >=
-            SAMPLE_RATE
-        )
+        if (samplesRecorded - (int)lastHeapLogSamples >= SAMPLE_RATE)
         {
-            lastHeapLogSamples =
-                (uint32_t)samplesRecorded;
-
-            Serial.println("Heap during speech recording:");
+            lastHeapLogSamples = (uint32_t)samplesRecorded;
+            Serial.println("Heap during speech streaming:");
             logFreeHeap();
         }
     }
 
-
     if (samplesRecorded >= totalSamples)
     {
-        Serial.println(
-            "VAD: 8 second safety cap reached."
-        );
+        Serial.println("VAD: 8 second safety cap reached.");
     }
-
-
-    // =================================================
-    // STOP I2S
-    // =================================================
 
     i2s_deinit();
-
-
-    Serial.println(
-        "Recording complete."
-    );
-
-    Serial.print("Recorded samples: ");
-    Serial.println(samplesRecorded);
-
-    Serial.println("Heap after speech recording:");
-    logFreeHeap();
-
-
-    if (samplesRecorded <= 0)
-    {
-        Serial.println(
-            "ERROR: No speech samples recorded."
-        );
-
-        free(
-            speechBuffer
-        );
-
-        return false;
-    }
-
-
-    // =================================================
-    // CHECK WIFI
-    // =================================================
-
-    if (
-        WiFi.status() !=
-        WL_CONNECTED
-    )
-    {
-        Serial.println(
-            "Wi-Fi disconnected. Reconnecting..."
-        );
-
-
-        connectWiFi();
-    }
-
-
-    if (
-        WiFi.status() !=
-        WL_CONNECTED
-    )
-    {
-        Serial.println(
-            "ERROR: No Wi-Fi connection."
-        );
-
-
-        free(
-            speechBuffer
-        );
-
-
-        return false;
-    }
-
-
-    // =================================================
-    // WAV INFORMATION
-    // =================================================
-
-    const uint32_t dataSize =
-        (uint32_t)samplesRecorded *
-        sizeof(int16_t);
-
-
-    const uint32_t wavSize =
-        44 +
-        dataSize;
-
-
-    uint8_t wavHeader[44] = {0};
-
-
-    // RIFF
-    memcpy(
-        wavHeader,
-        "RIFF",
-        4
-    );
-
-
-    uint32_t fileSize =
-        wavSize - 8;
-
-
-    memcpy(
-        wavHeader + 4,
-        &fileSize,
-        4
-    );
-
-
-    // WAVE
-    memcpy(
-        wavHeader + 8,
-        "WAVE",
-        4
-    );
-
-
-    // fmt
-    memcpy(
-        wavHeader + 12,
-        "fmt ",
-        4
-    );
-
-
-    uint32_t fmtSize = 16;
-
-
-    memcpy(
-        wavHeader + 16,
-        &fmtSize,
-        4
-    );
-
-
-    uint16_t audioFormat = 1;
-
-
-    memcpy(
-        wavHeader + 20,
-        &audioFormat,
-        2
-    );
-
-
-    uint16_t channels = 1;
-
-
-    memcpy(
-        wavHeader + 22,
-        &channels,
-        2
-    );
-
-
-    uint32_t sampleRate =
-        SAMPLE_RATE;
-
-
-    memcpy(
-        wavHeader + 24,
-        &sampleRate,
-        4
-    );
-
-
-    uint32_t byteRate =
-        SAMPLE_RATE *
-        channels *
-        sizeof(int16_t);
-
-
-    memcpy(
-        wavHeader + 28,
-        &byteRate,
-        4
-    );
-
-
-    uint16_t blockAlign =
-        channels *
-        sizeof(int16_t);
-
-
-    memcpy(
-        wavHeader + 32,
-        &blockAlign,
-        2
-    );
-
-
-    uint16_t bitsPerSample = 16;
-
-
-    memcpy(
-        wavHeader + 34,
-        &bitsPerSample,
-        2
-    );
-
-
-    // data
-    memcpy(
-        wavHeader + 36,
-        "data",
-        4
-    );
-
-
-    memcpy(
-        wavHeader + 40,
-        &dataSize,
-        4
-    );
-
-
-    // =================================================
-    // CONNECT TO FLASK SERVER
-    // =================================================
-
-    Serial.println();
-
-    Serial.println(
-        "Connecting to Flask server..."
-    );
-
-
-    WiFiClient client;
-
-
-    if (
-        !client.connect(
-            "192.168.1.44",
-            5001
-        )
-    )
-    {
-        Serial.println(
-            "ERROR: Could not connect to server."
-        );
-
-
-        free(
-            speechBuffer
-        );
-
-
-        return false;
-    }
-
-
-    // =================================================
-    // SEND HTTP HEADER
-    // =================================================
-
-    client.print(
-        "POST /audio HTTP/1.1\r\n"
-    );
-
-
-    client.print(
-        "Host: 192.168.1.44:5001\r\n"
-    );
-
-
-    client.print(
-        "Content-Type: audio/wav\r\n"
-    );
-
-
-    client.print(
-        "X-Device-RAM-KB: "
-    );
-
-    client.print(
-        lastFreeHeapBytes / 1024
-    );
-
-    client.print(
-        "\r\n"
-    );
-
-
-    client.print(
-        "X-Device-CPU-Percent: "
-    );
-
-    client.print(
-        lastIdleCpuPercent,
-        1
-    );
-
-    client.print(
-        "\r\n"
-    );
-
-
-    // Latency to this point (keyword-end through connect).
-    // Full keyword-end-to-upload-complete is printed after
-    // the body is sent; HTTP headers must go out first.
-    client.print(
-        "X-Detection-Latency-MS: "
-    );
-
-    client.print(
-        millis() - keywordEndMs
-    );
-
-    client.print(
-        "\r\n"
-    );
-
-
-    client.print(
-        "Content-Length: "
-    );
-
-
-    client.print(
-        wavSize
-    );
-
-
-    client.print(
-        "\r\n"
-    );
-
-
-    client.print(
-        "Connection: close\r\n"
-    );
-
-
-    client.print(
-        "\r\n"
-    );
-
-
-    // =================================================
-    // SEND WAV HEADER
-    // =================================================
-
-    size_t written =
-        client.write(
-            wavHeader,
-            44
-        );
-
-
-    if (
-        written != 44
-    )
-    {
-        Serial.println(
-            "ERROR: WAV header send failed."
-        );
-
-
-        client.stop();
-
-
-        free(
-            speechBuffer
-        );
-
-
-        return false;
-    }
-
-
-    // =================================================
-    // SEND AUDIO DATA
-    // =================================================
-
-    const uint8_t *audioBytes =
-        (const uint8_t *)speechBuffer;
-
-
-    size_t remaining =
-        dataSize;
-
-
-    while (
-        remaining > 0
-    )
-    {
-        size_t chunk =
-            remaining > 1024
-            ? 1024
-            : remaining;
-
-
-        size_t sent =
-            client.write(
-                audioBytes,
-                chunk
-            );
-
-
-        if (
-            sent == 0
-        )
-        {
-            Serial.println(
-                "ERROR: Audio send failed."
-            );
-
-
-            client.stop();
-
-
-            free(
-                speechBuffer
-            );
-
-
-            return false;
-        }
-
-
-        audioBytes += sent;
-
-
-        remaining -= sent;
-    }
-
-
-    Serial.println(
-        "Audio uploaded."
-    );
-
-
-    unsigned long uploadCompleteMs = millis();
-
-    unsigned long detectionLatencyMs =
-        uploadCompleteMs - keywordEndMs;
-
-    Serial.print(
-        "Latency (keyword-end to upload complete): "
-    );
-
-    Serial.print(detectionLatencyMs);
-
-    Serial.println(" ms");
-
-
-    // =================================================
-    // WAIT FOR SERVER RESPONSE
-    // =================================================
-
-    unsigned long timeout =
-        millis() + 5000;
-
-
-    while (
-        !client.available()
-        &&
-        millis() < timeout
-    )
-    {
-        delay(10);
-    }
-
-
-    if (
-        client.available()
-    )
-    {
-        String response =
-            client.readString();
-
-
-        Serial.println();
-
-        Serial.println(
-            "Server response:"
-        );
-
-
-        Serial.println(
-            response
-        );
-    }
-    else
-    {
-        Serial.println(
-            "No response from server."
-        );
-    }
-
-
     client.stop();
 
+    unsigned long utteranceMs =
+        ((unsigned long)samplesRecorded * 1000UL) / SAMPLE_RATE;
 
-    // =================================================
-    // FREE BUFFER
-    // =================================================
+    Serial.println("Stream closed (TCP FIN).");
+    Serial.print("Samples streamed: ");
+    Serial.println(samplesRecorded);
+    Serial.print("Utterance duration: ");
+    Serial.print(utteranceMs);
+    Serial.println(" ms");
+    Serial.println("Heap after stream (still no 250KB buffer):");
+    logFreeHeap();
 
-    free(
-        speechBuffer
-    );
-
-
-    return true;
+    return samplesRecorded > 0;
 }
 
+
+bool recordSpeechAndSend()
+{
+    return streamSpeechToServer();
+}
 
 // =====================================================
 // SENSOR CHECK
