@@ -14,3 +14,7 @@ __pycache__/
 
 # Arduino temporary files
 *.tmp
+
+# Runtime recordings from the Flask server / simulator
+server/latest_audio.wav
+*.wav

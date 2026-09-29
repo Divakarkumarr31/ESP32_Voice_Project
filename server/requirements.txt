@@ -1,2 +1,8 @@
 Flask
 faster-whisper
+numpy
+sounddevice
+requests
+# PyAV 19+ dropped av.open(..., metadata_errors=...) used by faster-whisper.
+# The server now decodes WAV itself, so this pin is optional extra safety.
+av>=11,<16

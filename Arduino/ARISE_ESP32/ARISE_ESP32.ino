@@ -13,7 +13,7 @@
  * 1. Continuously listen for ARISE
  * 2. If ARISE >= 0.80:
  *      - LED ON for 2 seconds
- *      - Record 5 seconds of speech
+ *      - Record speech until trailing silence (VAD), max 8 seconds
  *      - Send WAV to Mac Flask server
  *      - Restart wake-word detection
  */
@@ -23,6 +23,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <math.h>
 
 #include <Audio_Classification_-_Keyword_Spotting_inferencing.h>
 
@@ -66,13 +67,24 @@ const char* SERVER_URL =
 
 
 // =====================================================
-// POST-WAKE SPEECH RECORDING
+// POST-WAKE SPEECH RECORDING (VAD)
 // =====================================================
 
-#define SPEECH_SECONDS 5
+// Worst-case capture length. Recording can stop earlier
+// once trailing silence is detected.
+#define MAX_SPEECH_SECONDS 8
 
 #define SPEECH_SAMPLES \
-    (SAMPLE_RATE * SPEECH_SECONDS)
+    (SAMPLE_RATE * MAX_SPEECH_SECONDS)
+
+// RMS below this counts as silence (tunable).
+#define SILENCE_THRESHOLD 500.0f
+
+// Stop after this much consecutive silence (~600-800 ms).
+#define SILENCE_DURATION_MS 700
+
+// Ignore leading silence so VAD does not stop immediately.
+#define MIN_SPEECH_MS 250
 
 
 // =====================================================
@@ -115,6 +127,19 @@ static int print_results =
 static bool record_status = true;
 
 
+// Heap free at boot. Used RAM is approximated as
+// (heap-at-boot - current free heap).
+static uint32_t heapAtBoot = 0;
+
+// Last computed idle-CPU approximation for HTTP headers.
+// Not a FreeRTOS idle-task / scheduler statistic.
+static float lastIdleCpuPercent = 0.0f;
+
+static uint32_t lastFreeHeapBytes = 0;
+
+static unsigned long keywordEndMs = 0;
+
+
 // =====================================================
 // FUNCTION DECLARATIONS
 // =====================================================
@@ -151,6 +176,33 @@ bool recordSpeechAndSend();
 
 void connectWiFi();
 
+static uint32_t logFreeHeap();
+
+
+static uint32_t logFreeHeap()
+{
+    uint32_t freeHeap = ESP.getFreeHeap();
+
+    lastFreeHeapBytes = freeHeap;
+
+    uint32_t used = 0;
+
+    if (heapAtBoot > freeHeap)
+    {
+        used = heapAtBoot - freeHeap;
+    }
+
+    uint32_t usedKb = used / 1024;
+
+    Serial.print("Free heap: ");
+    Serial.print(freeHeap);
+    Serial.print(" bytes (");
+    Serial.print(usedKb);
+    Serial.println(" KB used of 256KB budget)");
+
+    return freeHeap;
+}
+
 
 // =====================================================
 // SETUP
@@ -161,6 +213,10 @@ void setup()
     Serial.begin(115200);
 
     delay(2000);
+
+    heapAtBoot = ESP.getFreeHeap();
+
+    lastFreeHeapBytes = heapAtBoot;
 
 
     // =================================================
@@ -293,12 +349,19 @@ void setup()
 
 void loop()
 {
+    unsigned long loopStartUs = micros();
+
+
     // =================================================
     // GET MICROPHONE DATA
     // =================================================
 
+    unsigned long captureStartUs = micros();
+
     bool m =
         microphone_inference_record();
+
+    unsigned long captureEndUs = micros();
 
 
     if (!m)
@@ -332,6 +395,16 @@ void loop()
 
     ei_impulse_result_t result = {0};
 
+    const bool logClassifierHeap =
+        (print_results + 1 >=
+         EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
+
+    if (logClassifierHeap)
+    {
+        logFreeHeap();
+    }
+
+    unsigned long classifierStartUs = micros();
 
     EI_IMPULSE_ERROR r =
         run_classifier_continuous(
@@ -339,6 +412,13 @@ void loop()
             &result,
             debug_nn
         );
+
+    unsigned long classifierEndUs = micros();
+
+    if (logClassifierHeap)
+    {
+        logFreeHeap();
+    }
 
 
     if (
@@ -358,11 +438,15 @@ void loop()
     // PRINT PREDICTIONS
     // =================================================
 
+    bool printedPredictions = false;
+    bool didWake = false;
+
     if (
         ++print_results >=
         EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW
     )
     {
+        printedPredictions = true;
         ei_printf(
             "\nPredictions:\n"
         );
@@ -438,6 +522,11 @@ void loop()
             WAKE_THRESHOLD
         )
         {
+            didWake = true;
+
+            // Keyword-end reference for latency (before LED / VAD / upload).
+            keywordEndMs = millis();
+
             ei_printf(
                 "\n================================\n"
             );
@@ -541,6 +630,49 @@ void loop()
 
 
         print_results = 0;
+    }
+
+
+    // Approx idle CPU from this loop iteration.
+    // busy = I2S capture-wait in loop() + classifier time.
+    // This is wall-clock share, not a true RTOS idle-task statistic.
+    if (!didWake)
+    {
+        unsigned long loopEndUs = micros();
+
+        unsigned long totalLoopUs = loopEndUs - loopStartUs;
+
+        unsigned long busyUs =
+            (captureEndUs - captureStartUs) +
+            (classifierEndUs - classifierStartUs);
+
+        float cpuBusyPercent = 0.0f;
+
+        if (totalLoopUs > 0)
+        {
+            cpuBusyPercent =
+                (100.0f * (float)busyUs) /
+                (float)totalLoopUs;
+        }
+
+        if (cpuBusyPercent > 100.0f)
+        {
+            cpuBusyPercent = 100.0f;
+        }
+
+        lastIdleCpuPercent = 100.0f - cpuBusyPercent;
+
+        if (lastIdleCpuPercent < 0.0f)
+        {
+            lastIdleCpuPercent = 0.0f;
+        }
+
+        if (printedPredictions)
+        {
+            Serial.print("Approx idle CPU: ");
+            Serial.print(lastIdleCpuPercent, 1);
+            Serial.println("%");
+        }
     }
 }
 
@@ -1108,6 +1240,9 @@ bool recordSpeechAndSend()
         return false;
     }
 
+    Serial.println("Heap after speech buffer alloc:");
+    logFreeHeap();
+
 
     // =================================================
     // START I2S
@@ -1156,7 +1291,7 @@ bool recordSpeechAndSend()
     );
 
     Serial.println(
-        "Recording 5 seconds..."
+        "Recording until silence (max 8 seconds)..."
     );
 
     Serial.println(
@@ -1166,11 +1301,21 @@ bool recordSpeechAndSend()
 
     int samplesRecorded = 0;
 
+    uint32_t consecutiveSilenceSamples = 0;
+
+    bool heardSpeech = false;
+
+    const uint32_t silenceNeedSamples =
+        (SAMPLE_RATE * SILENCE_DURATION_MS) / 1000;
+
+    const uint32_t minSpeechSamples =
+        (SAMPLE_RATE * MIN_SPEECH_MS) / 1000;
 
     int32_t rawBuffer[512];
 
-
     size_t bytesRead;
+
+    uint32_t lastHeapLogSamples = 0;
 
 
     while (
@@ -1213,6 +1358,16 @@ bool recordSpeechAndSend()
             bytesRead /
             sizeof(int32_t);
 
+        if (samplesRead <= 0)
+        {
+            continue;
+        }
+
+
+        int64_t sumSquares = 0;
+
+        int chunkCount = 0;
+
 
         for (
             int i = 0;
@@ -1221,13 +1376,81 @@ bool recordSpeechAndSend()
             i++
         )
         {
-            speechBuffer[
-                samplesRecorded++
-            ] =
+            int16_t sample =
                 (int16_t)(
                     rawBuffer[i] >> 16
                 );
+
+            speechBuffer[
+                samplesRecorded++
+            ] = sample;
+
+            sumSquares +=
+                (int32_t)sample *
+                (int32_t)sample;
+
+            chunkCount++;
         }
+
+
+        if (chunkCount <= 0)
+        {
+            break;
+        }
+
+
+        float rms = sqrtf(
+            (float)sumSquares /
+            (float)chunkCount
+        );
+
+
+        if (rms < SILENCE_THRESHOLD)
+        {
+            consecutiveSilenceSamples +=
+                (uint32_t)chunkCount;
+        }
+        else
+        {
+            consecutiveSilenceSamples = 0;
+            heardSpeech = true;
+        }
+
+
+        if (
+            heardSpeech &&
+            samplesRecorded >= (int)minSpeechSamples &&
+            consecutiveSilenceSamples >= silenceNeedSamples
+        )
+        {
+            Serial.println(
+                "VAD: trailing silence reached, stopping."
+            );
+
+            break;
+        }
+
+
+        if (
+            samplesRecorded -
+            (int)lastHeapLogSamples >=
+            SAMPLE_RATE
+        )
+        {
+            lastHeapLogSamples =
+                (uint32_t)samplesRecorded;
+
+            Serial.println("Heap during speech recording:");
+            logFreeHeap();
+        }
+    }
+
+
+    if (samplesRecorded >= totalSamples)
+    {
+        Serial.println(
+            "VAD: 8 second safety cap reached."
+        );
     }
 
 
@@ -1241,6 +1464,26 @@ bool recordSpeechAndSend()
     Serial.println(
         "Recording complete."
     );
+
+    Serial.print("Recorded samples: ");
+    Serial.println(samplesRecorded);
+
+    Serial.println("Heap after speech recording:");
+    logFreeHeap();
+
+
+    if (samplesRecorded <= 0)
+    {
+        Serial.println(
+            "ERROR: No speech samples recorded."
+        );
+
+        free(
+            speechBuffer
+        );
+
+        return false;
+    }
 
 
     // =================================================
@@ -1285,7 +1528,7 @@ bool recordSpeechAndSend()
     // =================================================
 
     const uint32_t dataSize =
-        totalSamples *
+        (uint32_t)samplesRecorded *
         sizeof(int16_t);
 
 
@@ -1478,6 +1721,49 @@ bool recordSpeechAndSend()
 
 
     client.print(
+        "X-Device-RAM-KB: "
+    );
+
+    client.print(
+        lastFreeHeapBytes / 1024
+    );
+
+    client.print(
+        "\r\n"
+    );
+
+
+    client.print(
+        "X-Device-CPU-Percent: "
+    );
+
+    client.print(
+        lastIdleCpuPercent,
+        1
+    );
+
+    client.print(
+        "\r\n"
+    );
+
+
+    // Latency to this point (keyword-end through connect).
+    // Full keyword-end-to-upload-complete is printed after
+    // the body is sent; HTTP headers must go out first.
+    client.print(
+        "X-Detection-Latency-MS: "
+    );
+
+    client.print(
+        millis() - keywordEndMs
+    );
+
+    client.print(
+        "\r\n"
+    );
+
+
+    client.print(
         "Content-Length: "
     );
 
@@ -1594,6 +1880,20 @@ bool recordSpeechAndSend()
     Serial.println(
         "Audio uploaded."
     );
+
+
+    unsigned long uploadCompleteMs = millis();
+
+    unsigned long detectionLatencyMs =
+        uploadCompleteMs - keywordEndMs;
+
+    Serial.print(
+        "Latency (keyword-end to upload complete): "
+    );
+
+    Serial.print(detectionLatencyMs);
+
+    Serial.println(" ms");
 
 
     // =================================================
