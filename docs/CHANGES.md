@@ -1,7 +1,7 @@
 # Changes since `main`
 
 This document describes everything added on top of the original ARISE repo
-(`main` commit: *Initial ARISE ESP32 voice activation system*).
+(`main` commit: _Initial ARISE ESP32 voice activation system_).
 
 Use it as a delta against the original README, which still describes the
 **record 5 seconds → HTTP WAV POST** baseline.
@@ -78,10 +78,10 @@ Flask still serves **`POST /audio`** as an HTTP fallback. Do not use it if you w
 
 **Latency split (do not mix these):**
 
-| Field | Meaning |
-|--------|---------|
+| Field                     | Meaning                                                  |
+| ------------------------- | -------------------------------------------------------- |
 | `stream_start_latency_ms` | Keyword-end → TCP command stream open (“wake-to-stream”) |
-| `utterance_duration_ms` | How long the user talked (not system latency) |
+| `utterance_duration_ms`   | How long the user talked (not system latency)            |
 
 **Note:** firmware still waits **~2 s for the LED** before opening the command stream, so hardware wake-to-stream includes that delay. The simulator has no LED.
 
@@ -97,15 +97,15 @@ The simulator process must print `tcp://127.0.0.1:5002`, not `:5001/audio`.
 
 **18-byte command header** (little-endian), after a type tag (see protocol):
 
-| Offset | Field |
-|--------|--------|
-| 0 | `uint32` sample rate (16000) |
-| 4 | `uint16` bits (16) |
-| 6 | `uint16` channels (1) |
-| 8 | `uint16` ram_kb |
-| 10 | `uint16` cpu × 10 |
-| 12 | `uint32` stream_start_latency_ms |
-| 16 | `uint16` confidence_x100 (`ariseConfidence * 10000`, range 0–10000) |
+| Offset | Field                                                               |
+| ------ | ------------------------------------------------------------------- |
+| 0      | `uint32` sample rate (16000)                                        |
+| 4      | `uint16` bits (16)                                                  |
+| 6      | `uint16` channels (1)                                               |
+| 8      | `uint16` ram_kb                                                     |
+| 10     | `uint16` cpu × 10                                                   |
+| 12     | `uint32` stream_start_latency_ms                                    |
+| 16     | `uint16` confidence_x100 (`ariseConfidence * 10000`, range 0–10000) |
 
 Server stores confidence as a **percent** (e.g. 96.42). Dashboard:
 
@@ -130,10 +130,10 @@ The ring + snapshot are **static BSS** (~`4 * WAKE_WINDOW_SAMPLES` bytes), not h
 
 **Protocol on port 5002**
 
-| Tag | Meaning |
-|-----|---------|
+| Tag    | Meaning                                                             |
+| ------ | ------------------------------------------------------------------- |
 | `0x01` | Wake window: then `uint32` sample count + raw int16 PCM, then close |
-| `0x02` | Command stream: then 18-byte header + PCM until FIN |
+| `0x02` | Command stream: then 18-byte header + PCM until FIN                 |
 
 Wake audio is stored as `latest_wake_window` and attached to the **next** command detection.
 
@@ -146,7 +146,72 @@ Log-mel images are generated with numpy FFT + a mel filterbank + **Pillow** (no 
 
 The simulator sends a ~1 s mic capture as tag `0x01`, then the live command stream as `0x02`.
 
+### 8. Dashboard redesign and team header
+
+**File:** `server/arise_server.py` (only the dashboard HTML/CSS/JS changed)
+
+- Three-tier card hierarchy (title / primary value / context), one spacing scale, tabular numerals.
+- Fonts: **JetBrains Mono + Inter** from Google Fonts, with system-font fallbacks so it still works offline.
+- System Resources: RAM, CPU and Model Size as three equal metrics (the "within budget" badge was removed from that panel; the per-row badge in the table stays).
+- Bottom row: **Latest Detection** card (left, 37%) + **Live Detections** table (right, 63%). The transcript is the most prominent element of the card.
+- Table: **Duration column removed**; "Wake→stream" column relabelled **Latency**.
+- Navbar: larger `EDGEWAKE` logo plus a team strip (event, team name, team ID, problem statement). Values live in the config block at the top of `arise_server.py`:
+
+```python
+EVENT_NAME = "SIH 2026"
+TEAM_NAME = "Neural Nomads1"
+TEAM_ID = "183857"
+PS_ID = "26172"
+```
+
+### 9. Cloud answer + spoken reply (Ollama + pyttsx3)
+
+**File:** `server/arise_server.py`  
+**New dependency:** `pyttsx3` (Python package). **Ollama** is a separate program.
+
+After Whisper finishes and the detection is logged, a **background thread**:
+
+1. Sends the transcript to a **local Ollama** model over HTTP (`http://localhost:11434/api/chat`, using Python's built-in `urllib`, so no `ollama` pip package is needed).
+2. Stores the one-sentence answer on the detection (`response`, `response_status`: `off` / `pending` / `done` / `failed`, plus `response_error` on failure).
+3. Speaks the answer **on the server** with offline `pyttsx3` (the ESP32 has no speaker, and this keeps the edge RAM/CPU budget untouched).
+
+Design rules:
+
+- Runs **after** the transcript is logged, so it never delays wake, stream, transcription, or the latency numbers.
+- Failures stay soft (dashboard shows `No response (<reason>)`; console prints exception type/message).
+- Dashboard: a small cyan **Response** line under the transcript in the Latest Detection card ("Thinking…" while pending).
+- The model is warmed up in the background when the server starts (3 attempts, 5 s apart).
+- urllib uses a no-proxy opener so Windows system proxies cannot hijack `localhost`.
+- Startup lists Ollama tags and warns if `OLLAMA_MODEL` is missing.
+
+Switches and settings at the top of `arise_server.py`:
+
+```python
+ENABLE_LLM_ANSWER = True      # False = skip the whole answer stage
+ENABLE_SPEECH = True          # False = show text only, no audio
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.2:3b"  # must match `ollama list`
+LLM_TIMEOUT_SEC = 90          # first load on CPU can exceed 20 s
+SPEECH_RATE = 165
+```
+
+Set `ENABLE_LLM_ANSWER = False` when recording the scored evaluation numbers (idle CPU, latency, true-positive rate).
+
 ---
+
+### 10. Ollama answer reliability (proxy / timeout / warm-up)
+
+**File:** `server/arise_server.py`
+
+Fixes for `ask_llm()` returning `None` while Ollama itself was healthy:
+
+- Bypass system HTTP proxies on all Ollama calls (`ProxyHandler({})`).
+- Raise `LLM_TIMEOUT_SEC` to **90** (model load + Whisper on CPU).
+- Richer console errors (`type(e).__name__`, HTTP body on `HTTPError`).
+- Warm-up retries (3×, 5 s apart) with `LLM warm-up OK` / `LLM warm-up failed: …`.
+- Dashboard `response_error` (e.g. `timeout`, `connection refused`, `model not found`).
+- Startup `GET /api/tags` warns if `OLLAMA_MODEL` is not installed.
+- Dashboard **Speak** button (`POST /api/speak/<id>`) re-plays the latest answer via `pyttsx3` on the server speakers.
 
 ## Current runtime architecture
 
@@ -157,6 +222,7 @@ INMP441 → ESP32 → Edge Impulse (ARISE ≥ 0.80)
                 → LED ~2 s
                 → TCP 0x02 + header + live PCM (VAD / 8 s)
                 → Flask 5001 dashboard + Whisper on command close
+                → (background) Ollama answer → dashboard Response + spoken on server
 ```
 
 ---
@@ -166,6 +232,19 @@ INMP441 → ESP32 → Edge Impulse (ARISE ≥ 0.80)
 Repo root in these examples: `D:\Coding\sih` (change the path if yours is different).
 
 ### 0. One-time: Python virtualenv and packages
+
+`server/requirements.txt` must now include `pyttsx3`:
+
+```text
+Flask
+faster-whisper
+numpy
+sounddevice
+requests
+pillow
+pyttsx3
+av>=11,<16
+```
 
 **Windows (PowerShell)**
 
@@ -192,13 +271,54 @@ source .venv/bin/activate
 
 `scripts/setup.sh` creates `server/.venv` and installs `server/requirements.txt`. After that, always `source .venv/bin/activate` before running Python.
 
+**Linux only:** `pyttsx3` needs the system speech engine:
+
+```bash
+sudo apt install espeak-ng
+```
+
+Windows and macOS use the built-in voices, so nothing extra is needed.
+
 The first Flask start may **download the Whisper `base` model** (needs internet once).
 
 ---
 
-### 1. Start the Flask server (required)
+### 0b. One-time: install Ollama and pull the model
 
-Keep this terminal open.
+1. Download and install **Ollama** from `https://ollama.com` (free, open-source).
+2. Pull the model (about 2 GB, internet needed only for this step):
+
+```powershell
+ollama pull llama3.2:3b
+```
+
+3. Confirm the model is installed:
+
+```powershell
+ollama list
+```
+
+The name in the list must match `OLLAMA_MODEL` in `arise_server.py`.
+
+---
+
+### 1. Start Ollama, then the Flask server (required)
+
+Keep both running.
+
+**1a. Ollama** (skip if the desktop app is already running in the background on Windows/macOS):
+
+```powershell
+ollama serve
+```
+
+Check it is up: open `http://localhost:11434` in a browser (it says "Ollama is running"), or:
+
+```powershell
+curl http://localhost:11434
+```
+
+**1b. Flask server** (a separate terminal from `ollama serve`)
 
 **Windows**
 
@@ -242,7 +362,7 @@ From a phone on the same Wi-Fi, use this PC’s LAN IP instead of `127.0.0.1` (s
 
 ### 3. Laptop simulator (no ESP32)
 
-Use a **second** terminal. The server from step 1 must already be running.
+Use a **new** terminal. The server from step 1 must already be running.
 
 **Windows**
 
@@ -273,8 +393,8 @@ Then:
 1. Allow **microphone** access if the OS asks.
 2. Press **Enter** (simulated wake word).
 3. Wait ~1 second (wake-window capture).
-4. Speak the command; it stops after silence or 8 seconds.
-5. Watch the dashboard: waveform, spectrograms, then transcript.
+4. Speak the command (for example, "What is the capital of France?"); it stops after silence or 8 seconds.
+5. Watch the dashboard: waveform, spectrograms, transcript, then the **Response** line ("Thinking…" then the answer), and listen for the spoken reply.
 
 Stop the simulator: **Ctrl+C**.
 
@@ -312,18 +432,23 @@ Use the **IPv4 Address** of the Wi-Fi adapter (same network as the ESP32).
 6. Click **Verify**, then **Upload**. Close Serial Monitor during upload if the port is busy.
 7. Power the ESP32, wait for Wi-Fi, say **ARISE**, then the command after the LED.
 
-PC and ESP32 must be on the **same LAN**. The ESP32 talks to `SERVER_HOST:5002` (PCM) and optionally `:5001` (HTTP fallback).
+PC and ESP32 must be on the **same LAN**. The ESP32 talks to `SERVER_HOST:5002` (PCM) and optionally `:5001` (HTTP fallback). Ollama and speech run only on the PC; the ESP32 never talks to them.
+
+**Speaker placement:** keep the PC speaker volume moderate and away from the INMP441 mic. A spoken reply that re-triggers the wake word would count as a false activation.
 
 ---
 
 ### 5. Recommended order every session
 
 ```text
-1. python arise_server.py
-2. Browser → http://127.0.0.1:5001
-3. Either python simulate_esp32.py
+1. ollama serve            (or confirm the Ollama app is running)
+2. python arise_server.py
+3. Browser → http://127.0.0.1:5001
+4. Either python simulate_esp32.py
    or power/upload the ESP32
 ```
+
+Start Ollama and the server a few minutes before a demo so the model is already loaded.
 
 After pulling new code, stop both Python processes, reinstall deps if `requirements.txt` changed, start the server, then the simulator.
 
@@ -348,45 +473,66 @@ curl http://127.0.0.1:5001/api/data
 curl http://127.0.0.1:5001/api/waveform
 ```
 
-Stop Flask / simulator: **Ctrl+C** in that terminal.
+Ollama is running and the model exists:
+
+```powershell
+curl http://localhost:11434
+ollama list
+```
+
+Quick manual test of the model, outside the project:
+
+```powershell
+ollama run llama3.2:3b "What is the capital of France? Answer in one sentence."
+```
+
+Stop Flask / simulator / Ollama: **Ctrl+C** in that terminal.
 
 ---
 
 ### 7. Typical failures
 
-| Symptom | What to run / check |
-|---------|---------------------|
-| `Activate.ps1` cannot be loaded | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` then activate again |
-| `ModuleNotFoundError: PIL` | `pip install pillow` or `pip install -r requirements.txt` |
-| Simulator `ConnectionRefusedError` | `python arise_server.py` is not running, or port 5002 blocked |
-| Waveform never moves | Simulator must be TCP (`:5002`); restart both processes; hard-refresh the browser |
-| ESP32 cannot reach server | Wrong `SERVER_HOST`, different Wi-Fi, or firewall on 5002 |
-| Whisper `metadata_errors` | Use current `arise_server.py` (PCM/WAV loaded without PyAV `open`) |
+| Symptom                                                        | What to run / check                                                                                           |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `Activate.ps1` cannot be loaded                                | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` then activate again                              |
+| `ModuleNotFoundError: PIL`                                     | `pip install pillow` or `pip install -r requirements.txt`                                                     |
+| `ModuleNotFoundError: pyttsx3` / console prints `Speech error` | `pip install pyttsx3`; on Linux also `sudo apt install espeak-ng`                                             |
+| Simulator `ConnectionRefusedError`                             | `python arise_server.py` is not running, or port 5002 blocked                                                 |
+| Waveform never moves                                           | Simulator must be TCP (`:5002`); restart both processes; hard-refresh the browser                             |
+| ESP32 cannot reach server                                      | Wrong `SERVER_HOST`, different Wi-Fi, or firewall on 5002                                                     |
+| Whisper `metadata_errors`                                      | Use current `arise_server.py` (PCM/WAV loaded without PyAV `open`)                                            |
+| Response says "No response (…)"                                | Read the reason in parentheses / console `LLM error:`; check Ollama, model name, proxy, or timeout            |
+| First answer is very slow                                      | Model still loading; wait for warm-up (`LLM warm-up OK`) or ask again; `LLM_TIMEOUT_SEC` is 90                 |
+| Answer shows but no sound                                      | `pip install pyttsx3` in the venv, restart server; check console for `Speech error:` / `Speaking:`            |
+| No Response line activity at all                               | `ENABLE_LLM_ANSWER = False` in `arise_server.py`, or the transcript was "Could not recognize speech."         |
+| Speak button stays disabled                                    | Wait until Response status is `done` (answer text visible); `ENABLE_SPEECH` must be `True`                     |
 
 ---
 
 ## Config cheat sheet
 
-| Item | Value |
-|------|--------|
-| Flask | `0.0.0.0:5001` |
-| PCM stream | `5002` |
-| Wake threshold | 0.80 |
-| VAD silence | 700 ms, RMS 500 |
-| Max command | 8 s |
-| RAM / CPU budgets | 256 KB, 10% idle CPU (as displayed) |
+| Item                  | Value                                         |
+| --------------------- | --------------------------------------------- |
+| Flask                 | `0.0.0.0:5001`                                |
+| PCM stream            | `5002`                                        |
+| Ollama                | `http://localhost:11434`, model `llama3.2:3b` |
+| Wake threshold        | 0.80                                          |
+| VAD silence           | 700 ms, RMS 500                               |
+| Max command           | 8 s                                           |
+| RAM / CPU budgets     | 256 KB, 10% idle CPU (as displayed)           |
+| LLM / speech switches | `ENABLE_LLM_ANSWER`, `ENABLE_SPEECH`          |
 
 ---
 
 ## Git branches (as of this write-up)
 
-| Branch | Contents |
-|--------|----------|
-| `main` | Original 5 s WAV + simple Flask page |
-| `feature/edgewake-vad-dashboard` | VAD, metrics, dashboard, HTTP simulator era |
+| Branch                             | Contents                                                                                                       |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `main`                             | Original 5 s WAV + simple Flask page                                                                           |
+| `feature/edgewake-vad-dashboard`   | VAD, metrics, dashboard, HTTP simulator era                                                                    |
 | `feature/edgewake-live-tcp-stream` | TCP streaming + live waveform (push further commits for spectrograms / 18-byte header if they are still local) |
 
-Uncommitted local work after the last push may include confidence/trend/budget/uptime and wake-window spectrograms — keep this file in the same commit as those sources.
+Uncommitted local work after the last push may include confidence/trend/budget/uptime, wake-window spectrograms, the dashboard redesign, and the Ollama answer stage — keep this file in the same commit as those sources.
 
 ---
 
@@ -395,7 +541,7 @@ Uncommitted local work after the last push may include confidence/trend/budget/u
 - `Arduino/ARISE_ESP32/ARISE_ESP32.ino`
 - `server/arise_server.py`
 - `server/simulate_esp32.py` (new)
-- `server/requirements.txt` — Flask, faster-whisper, numpy, sounddevice, requests, pillow, `av>=11,<16`
+- `server/requirements.txt` — Flask, faster-whisper, numpy, sounddevice, requests, pillow, **pyttsx3**, `av>=11,<16`
 - `.gitignore` — `server/latest_audio.wav`, `*.wav`
 
 ---
@@ -406,3 +552,4 @@ Uncommitted local work after the last push may include confidence/trend/budget/u
 - INMP441 pinout and 16 kHz / 32-bit I2S → 16-bit conversion
 - True/false-positive mark buttons
 - HTTP `/audio` kept as fallback until hardware streaming is fully signed off
+- ESP32 firmware for the answer stage: none; Ollama and speech run only on the PC

@@ -6,7 +6,10 @@ import socket
 import struct
 import threading
 import io
+import json
 import base64
+import urllib.request
+import urllib.error
 from collections import deque
 from datetime import datetime
 
@@ -52,6 +55,18 @@ EVENT_NAME = "SIH 2026"
 TEAM_NAME = "Neural Nomads1"
 TEAM_ID = "183857"
 PS_ID = "26172"
+
+# Cloud-side answer + speech (optional, runs after ASR; never affects wake/latency metrics)
+ENABLE_LLM_ANSWER = True
+ENABLE_SPEECH = True
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.2:3b"   # any model you have pulled: `ollama pull llama3.2:3b`
+LLM_TIMEOUT_SEC = 90
+LLM_SYSTEM_PROMPT = (
+    "You are a voice assistant. Answer in one short plain-text sentence. "
+    "No markdown, no lists, no emojis."
+)
+SPEECH_RATE = 165
 
 STREAM_HOST = "0.0.0.0"
 STREAM_PORT = 5002
@@ -390,9 +405,202 @@ def log_detection(
         "wake_window_samples": int(np.asarray(latest_wake_window).size) if latest_wake_window is not None else 0,
         "transcript": transcript,
         "status": "pending",
+        "response": None,
+        "response_status": "off",
+        "response_error": None,
     })
     next_id += 1
     latest_wake_window = None
+    return next_id - 1
+
+
+speak_lock = threading.Lock()
+
+
+def _llm_error_reason(exc):
+    """Short reason string for the dashboard Response line."""
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, socket.timeout):
+        return "timeout"
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 404:
+            return "model not found"
+        return "HTTP %s" % exc.code
+    if isinstance(exc, urllib.error.URLError):
+        reason = str(getattr(exc, "reason", exc)).lower()
+        if "timed out" in reason or "timeout" in reason:
+            return "timeout"
+        if "refused" in reason:
+            return "connection refused"
+        return str(getattr(exc, "reason", exc))[:80]
+    msg = str(exc).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return "timeout"
+    if "refused" in msg:
+        return "connection refused"
+    if "not found" in msg:
+        return "model not found"
+    return type(exc).__name__
+
+
+def ask_llm(question):
+    """Ask the local Ollama server. Returns (answer, error_reason).
+
+    On success error_reason is None. On failure answer is None and
+    error_reason is a short string (e.g. "timeout").
+    """
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        "stream": False,
+        "keep_alive": "30m",
+        "options": {"num_predict": 80, "temperature": 0.3},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=LLM_TIMEOUT_SEC) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        answer = (body.get("message", {}).get("content") or "").strip()
+        if not answer:
+            return None, "empty response"
+        return answer, None
+    except Exception as e:
+        print("LLM error:", type(e).__name__, str(e))
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                print("LLM HTTP body:", e.read().decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+        return None, _llm_error_reason(e)
+
+
+def speak_text(text):
+    """Speak on the server (offline, pyttsx3). Fails quietly with a console line."""
+    if not text:
+        return
+    with speak_lock:
+        try:
+            # Windows SAPI needs COM initialized in each worker thread.
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+                com_ready = True
+            except Exception:
+                com_ready = False
+
+            import pyttsx3
+            print("Speaking:", text[:120])
+            engine = pyttsx3.init()
+            engine.setProperty("rate", SPEECH_RATE)
+            engine.say(text)
+            engine.runAndWait()
+            engine.stop()
+            print("Speech done.")
+        except Exception as e:
+            print("Speech error:", type(e).__name__, str(e))
+        finally:
+            if "com_ready" in locals() and com_ready:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+
+def answer_worker(det_id, question):
+    row = None
+    for d in detections:
+        if d["id"] == det_id:
+            row = d
+            break
+    if row is None:
+        return
+
+    print("Asking local LLM:", question)
+    answer, err = ask_llm(question)
+    if not answer:
+        row["response_status"] = "failed"
+        row["response_error"] = err or "LLM unavailable"
+        return
+
+    print("LLM answer:", answer)
+    row["response"] = answer
+    row["response_status"] = "done"
+    row["response_error"] = None
+
+    if ENABLE_SPEECH:
+        speak_text(answer)
+
+
+def start_answer(det_id, transcript):
+    """Kick off LLM answer + speech in the background (skipped if disabled)."""
+    if not ENABLE_LLM_ANSWER or det_id is None:
+        return
+    if not transcript or transcript.startswith("Could not recognize") \
+            or transcript.startswith("Speech recognition error"):
+        return
+    for d in detections:
+        if d["id"] == det_id:
+            d["response_status"] = "pending"
+            d["response_error"] = None
+            break
+    threading.Thread(
+        target=answer_worker, args=(det_id, transcript), daemon=True
+    ).start()
+
+
+def check_ollama_model():
+    """GET /api/tags once; warn if OLLAMA_MODEL is missing."""
+    if not ENABLE_LLM_ANSWER:
+        return
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        req = urllib.request.Request(OLLAMA_URL + "/api/tags", method="GET")
+        with opener.open(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        names = [m.get("name") for m in body.get("models", []) if m.get("name")]
+        if OLLAMA_MODEL not in names:
+            print(
+                "WARNING: OLLAMA_MODEL %r is not in Ollama's model list. "
+                "Available: %s"
+                % (OLLAMA_MODEL, ", ".join(names) if names else "(none)")
+            )
+        else:
+            print("Ollama model present:", OLLAMA_MODEL)
+    except Exception as e:
+        print(
+            "WARNING: could not list Ollama models:",
+            type(e).__name__,
+            str(e),
+        )
+
+
+def warm_up_llm():
+    """Load the model into memory so the first real question isn't slow."""
+    if not ENABLE_LLM_ANSWER:
+        return
+    check_ollama_model()
+    last_err = "unknown"
+    for attempt in range(3):
+        answer, err = ask_llm("Say ready.")
+        if answer:
+            print("LLM warm-up OK")
+            return
+        last_err = err or "unknown"
+        print("LLM warm-up attempt %d/3 failed: %s" % (attempt + 1, last_err))
+        if attempt < 2:
+            time.sleep(5)
+    print("LLM warm-up failed: %s" % last_err)
 
 
 def recv_exact(conn, nbytes):
@@ -515,7 +723,7 @@ def handle_command_stream(conn, addr):
     text, info = transcribe_float32(audio)
     command_pcm = np.frombuffer(bytes(pcm), dtype="<i2").copy() if len(pcm) >= 2 else None
 
-    log_detection(
+    det_id = log_detection(
         ram_kb,
         cpu_percent,
         stream_latency_ms,
@@ -525,6 +733,7 @@ def handle_command_stream(conn, addr):
         command_pcm
     )
     set_pipeline_state("listening")
+    start_answer(det_id, text)
 
 
 def handle_stream_client(conn, addr):
@@ -901,39 +1110,104 @@ body {
 .value.conf-ok { color: var(--success); }
 .value.conf-warn { color: var(--warn); }
 .value.conf-bad { color: var(--danger); }
-.ce-transcript-col {
+
+/* transcript + response: one combined block */
+.convo {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--inset);
   border: 1px solid var(--border);
-  border-left: 2px solid var(--accent);
   border-radius: 6px;
-  padding: var(--s2) var(--s3);
+  overflow: hidden;
 }
-.ce-transcript-col .label {
+.convo-row {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--s2) var(--s3);
+  border-left: 2px solid var(--border-strong);
+}
+.convo-in { flex: 2 1 0; border-left-color: var(--accent); }
+.convo-out { flex: 3 1 0; border-top: 1px solid var(--border); }
+.convo-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s1);
+  margin-bottom: 6px;
+  min-height: 22px;
+  flex-shrink: 0;
+}
+.convo-label {
   font-size: 0.62rem;
   font-weight: 600;
   letter-spacing: 1.1px;
   text-transform: uppercase;
   color: var(--text-faint);
-  margin-bottom: var(--s1);
-  flex-shrink: 0;
 }
-.ce-transcript-col .text {
+.convo-row .text {
   flex: 1;
   min-height: 0;
-  font-size: clamp(1.05rem, 1.6vw, 1.45rem);
-  font-weight: 500;
-  line-height: 1.4;
   color: var(--text);
   display: -webkit-box;
-  -webkit-line-clamp: 5;
   -webkit-box-orient: vertical;
   overflow: hidden;
   word-break: break-word;
 }
+.convo-in .text {
+  font-size: clamp(1.05rem, 1.6vw, 1.45rem);
+  font-weight: 500;
+  line-height: 1.35;
+  -webkit-line-clamp: 3;
+}
+.convo-out .text {
+  font-size: clamp(0.92rem, 1.25vw, 1.12rem);
+  font-weight: 400;
+  line-height: 1.45;
+  -webkit-line-clamp: 4;
+}
+.convo-out .text.dim { color: var(--text-faint); }
+.convo-out .text.warn { color: var(--warn); }
+.convo-out .text.thinking::after {
+  content: "...";
+  display: inline-block;
+  vertical-align: bottom;
+  overflow: hidden;
+  width: 0;
+  animation: dots 1.2s steps(4, end) infinite;
+}
+@keyframes dots { to { width: 1.1em; } }
+button.speak-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+button.speak-btn::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+button.speak-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button.speak-btn:disabled { opacity: 0.35; cursor: default; }
+button.speak-btn.speaking:disabled { opacity: 1; color: var(--accent); border-color: var(--accent); }
+button.speak-btn.speaking::before { animation: pulse 0.9s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.2; } }
 
 /* history table */
 .table-wrap { flex: 1; min-height: 0; overflow-y: auto; border-radius: 6px; }
@@ -1129,9 +1403,18 @@ button.mark.wrong:hover { border-color: var(--danger); color: var(--danger); }
           <div class="value" id="ce-latency">--</div>
         </div>
       </div>
-      <div class="ce-transcript-col">
-        <div class="label">Latest transcript</div>
-        <div class="text" id="ce-transcript">Waiting for first detection...</div>
+      <div class="convo">
+        <div class="convo-row convo-in">
+          <div class="convo-label-row"><div class="convo-label">Transcript</div></div>
+          <div class="text" id="ce-transcript">Waiting for first detection...</div>
+        </div>
+        <div class="convo-row convo-out">
+          <div class="convo-label-row">
+            <div class="convo-label">Response</div>
+            <button type="button" class="speak-btn" id="speak-btn" disabled onclick="speakLatest()">Speak</button>
+          </div>
+          <div class="text dim" id="ce-response">--</div>
+        </div>
       </div>
     </div>
 
@@ -1164,6 +1447,7 @@ button.mark.wrong:hover { border-color: var(--danger); color: var(--danger); }
 <script>
 const WAKE_THRESHOLD_PERCENT = {{ wake_threshold_percent }};
 const WAKE_KEYWORD = "ARISE";
+let latestSpeakId = null;
 
 const STATE_LABELS = {
   listening: 'LISTENING',
@@ -1244,6 +1528,29 @@ async function refresh() {
       document.getElementById('ce-confidence').className = 'value ' + confidenceClass(conf);
       document.getElementById('ce-latency').textContent = wakeMs + ' ms';
       document.getElementById('ce-transcript').textContent = data.latest.transcript || 'Could not recognize speech.';
+
+      const respEl = document.getElementById('ce-response');
+      const speakBtn = document.getElementById('speak-btn');
+      const rs = data.latest.response_status;
+      if (rs === 'done') {
+        respEl.textContent = data.latest.response;
+        respEl.className = 'text';
+        latestSpeakId = data.latest.id;
+        speakBtn.disabled = false;
+      } else {
+        latestSpeakId = null;
+        speakBtn.disabled = true;
+        if (rs === 'pending') {
+          respEl.textContent = 'Thinking';
+          respEl.className = 'text dim thinking';
+        } else if (rs === 'failed') {
+          respEl.textContent = 'No response (' + (data.latest.response_error || 'LLM unavailable') + ')';
+          respEl.className = 'text warn';
+        } else {
+          respEl.textContent = '--';
+          respEl.className = 'text dim';
+        }
+      }
 
       const wakeImg = document.getElementById('wake-spec');
       const wakePh = document.getElementById('wake-spec-placeholder');
@@ -1342,6 +1649,36 @@ async function refreshWave() {
 async function mark(id, status) {
   await fetch('/api/mark/' + id + '/' + status, { method: 'POST' });
   refresh();
+}
+
+async function speakLatest() {
+  const btn = document.getElementById('speak-btn');
+  const url = latestSpeakId != null ? ('/api/speak/' + latestSpeakId) : '/api/speak';
+  btn.disabled = true;
+  btn.textContent = 'Speaking...';
+  btn.classList.add('speaking');
+  try {
+    const res = await fetch(url, { method: 'POST' });
+    const body = await res.json().catch(function() { return {}; });
+    if (!res.ok) {
+      console.error('Speak failed', res.status, body);
+      btn.textContent = 'Speak';
+      btn.classList.remove('speaking');
+      btn.disabled = latestSpeakId == null;
+      return;
+    }
+  } catch (e) {
+    console.error(e);
+    btn.textContent = 'Speak';
+    btn.classList.remove('speaking');
+    btn.disabled = latestSpeakId == null;
+    return;
+  }
+  setTimeout(function() {
+    btn.textContent = 'Speak';
+    btn.classList.remove('speaking');
+    refresh();
+  }, 800);
 }
 
 refresh();
@@ -1454,6 +1791,35 @@ def api_mark(detection_id, status):
     return jsonify({"status": "error", "message": "not found"}), 404
 
 
+@app.route("/api/speak/<int:detection_id>", methods=["POST"])
+@app.route("/api/speak", methods=["POST"])
+def api_speak(detection_id=None):
+    """Re-speak a detection's LLM response on the server (pyttsx3)."""
+    if not ENABLE_SPEECH:
+        return jsonify({"status": "error", "message": "speech disabled"}), 400
+
+    row = None
+    if detection_id is not None:
+        for d in detections:
+            if d["id"] == detection_id:
+                row = d
+                break
+        if row is None:
+            return jsonify({"status": "error", "message": "not found"}), 404
+    else:
+        row = detections[-1] if detections else None
+        if row is None:
+            return jsonify({"status": "error", "message": "no detections"}), 404
+
+    text = row.get("response")
+    if not text or row.get("response_status") != "done":
+        return jsonify({"status": "error", "message": "no response"}), 400
+
+    print("Speak requested for detection", row["id"])
+    threading.Thread(target=speak_text, args=(text,), daemon=True).start()
+    return jsonify({"status": "ok", "id": row["id"]})
+
+
 # =====================================================
 # AUDIO ENDPOINT (HTTP fallback — keep until stream is verified)
 # =====================================================
@@ -1534,7 +1900,7 @@ def receive_audio():
     if len(request.data) > 44:
         command_pcm = np.frombuffer(request.data[44:], dtype="<i2")
 
-    log_detection(
+    det_id = log_detection(
         ram_kb,
         cpu_percent,
         latency_ms,
@@ -1543,6 +1909,7 @@ def receive_audio():
         confidence,
         command_pcm
     )
+    start_answer(det_id, latest_text)
 
     return jsonify(response_payload), status_code
 
@@ -1571,6 +1938,7 @@ if __name__ == "__main__":
     print()
 
     start_stream_server()
+    threading.Thread(target=warm_up_llm, daemon=True).start()
 
     app.run(
         host="0.0.0.0",
