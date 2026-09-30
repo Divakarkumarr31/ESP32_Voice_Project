@@ -47,6 +47,12 @@ CPU_BUDGET_PERCENT = 10
 MODEL_SIZE_KB = 94  # update to your actual exported model size
 WAKE_THRESHOLD = 0.80  # must match firmware WAKE_THRESHOLD
 
+# Team / event details shown in the dashboard navbar
+EVENT_NAME = "SIH 2026"
+TEAM_NAME = "Neural Nomads1"
+TEAM_ID = "183857"
+PS_ID = "26172"
+
 STREAM_HOST = "0.0.0.0"
 STREAM_PORT = 5002
 STREAM_RECV_CHUNK = 2048
@@ -593,19 +599,29 @@ DASHBOARD_HTML = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>EdgeWake Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg: #0a0e14;
-  --panel: #10151f;
-  --border: #212a3a;
+  --bg: #080c12;
+  --panel: #0e131c;
+  --inset: #0a0e15;
+  --border: #1c2534;
+  --border-strong: #283447;
   --accent: #22d3ee;
   --success: #4ade80;
   --warn: #fbbf24;
   --danger: #f87171;
   --text: #e7ebf1;
   --text-dim: #7c8aa0;
-  --mono: 'Roboto Mono', 'SF Mono', 'Courier New', monospace;
-  --sans: -apple-system, 'Segoe UI', Arial, sans-serif;
+  --text-faint: #56647a;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, 'Courier New', monospace;
+  --sans: 'Inter', -apple-system, 'Segoe UI', Arial, sans-serif;
+  --s1: 8px;
+  --s2: 12px;
+  --s3: 16px;
+  --radius: 8px;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; overflow: hidden; }
@@ -614,262 +630,199 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
 }
 .board {
   height: 100vh;
-  padding: 1.3vh 1.6vw;
+  padding: var(--s2) var(--s3);
   display: grid;
-  grid-template-rows: auto 21vh 24vh 12vh 1fr;
-  gap: 1.1vh;
+  grid-template-rows: auto minmax(0, 19vh) minmax(0, 25vh) minmax(0, 1fr);
+  gap: var(--s2);
 }
 
 /* ---------- header ---------- */
 .topbar {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  column-gap: 28px;
+  padding: 2px 2px 4px;
 }
 .brand .logo {
   font-family: var(--mono);
-  font-size: 1.4rem;
+  font-size: clamp(2rem, 3.1vw, 2.7rem);
   font-weight: 700;
-  letter-spacing: 0.5px;
+  letter-spacing: 2px;
   line-height: 1;
 }
 .brand .logo em { font-style: normal; color: var(--accent); }
-.brand .tagline {
-  font-size: 0.68rem;
-  color: var(--text-dim);
-  margin-top: 0.15rem;
+.brand .tagline { font-size: 0.78rem; color: var(--text-dim); margin-top: 6px; letter-spacing: 0.2px; }
+.meta-strip {
+  justify-self: center;
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
 }
-.status {
-  text-align: right;
-  font-size: 0.68rem;
-  color: var(--text-dim);
-  line-height: 1.5;
+.meta-item { padding: 8px 18px; border-left: 1px solid var(--border); min-width: 0; }
+.meta-item:first-child { border-left: none; }
+.meta-item .label {
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 5px;
+  white-space: nowrap;
 }
+.meta-item .value {
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  white-space: nowrap;
+}
+.meta-item .value.accent { color: var(--accent); }
+.status { text-align: right; font-size: 0.7rem; color: var(--text-dim); line-height: 1.5; }
 .status .conn-line {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 0.4rem;
-  font-size: 0.76rem;
+  gap: 6px;
   font-family: var(--mono);
-  font-weight: 600;
-  letter-spacing: 0.5px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
   color: var(--text);
 }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); flex-shrink: 0; }
 .dot.on { background: var(--success); }
 
-/* ---------- generic panel ---------- */
+/* ---------- panels ---------- */
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.7rem 0.9rem;
+  border-radius: var(--radius);
+  padding: var(--s2) var(--s3);
   display: flex;
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
 }
 .panel-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  margin-bottom: 0.5rem;
+  margin-bottom: var(--s2);
   flex-shrink: 0;
 }
 .panel-title {
-  font-size: 0.76rem;
-  font-weight: 700;
-  letter-spacing: 0.6px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 1.1px;
   text-transform: uppercase;
-  color: var(--text);
-  border-left: 2px solid var(--accent);
-  padding-left: 0.5rem;
-}
-.section-tag {
-  font-size: 0.66rem;
   color: var(--text-dim);
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  margin-bottom: 0.35rem;
+  border-left: 2px solid var(--accent);
+  padding-left: var(--s1);
+  line-height: 1;
 }
 
-/* ---------- EVALUATION hero (primary) ---------- */
-/* Typography scale for this section only:
-   section-tag (label of the panel) < eval-stat .label (metric name)
-   < eval-stat .value.secondary < eval-stat .value.hero (the number
-   that has to be readable from across a room) < .unit (subordinate,
-   always smaller/dimmer than the number it rides next to). */
-.evaluation {
-  display: grid;
-  grid-template-columns: 1.1fr 1fr 0.85fr;
-  gap: 0.9vw;
-  min-height: 0;
-}
-.eval-panel {
-  border-color: #2a3a52;
-  padding: 0.8rem 1.1rem 0.85rem;
-}
-.eval-panel .section-tag {
-  font-size: 0.74rem;
-  font-weight: 700;
-  letter-spacing: 0.7px;
-  color: var(--text-dim);
-  margin-bottom: 0.6rem;
-}
-.eval-body {
-  flex: 1;
-  display: flex;
-  align-items: flex-end;
-  gap: 1.6rem;
-  min-height: 0;
-}
-.eval-stat {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  padding-right: 1.4rem;
-  border-right: 1px solid var(--border);
-}
-.eval-stat:last-child {
-  padding-right: 0;
-  border-right: none;
-}
-.eval-stat .label {
-  font-size: 0.8rem;
+/* ---------- shared stat anatomy ---------- */
+.stat { min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; }
+.stat .label {
+  font-size: 0.72rem;
   font-weight: 500;
   color: var(--text-dim);
   white-space: nowrap;
-  margin-bottom: 0.3rem;
+  margin-bottom: 6px;
 }
-.eval-stat .value {
+.stat .value, .ce-metric .value {
   font-family: var(--mono);
   font-weight: 700;
-  font-size: clamp(1.3rem, 2.1vw, 1.8rem);
+  font-variant-numeric: tabular-nums;
   line-height: 1;
   white-space: nowrap;
   color: var(--text);
 }
-/* Hero tier: the one number per panel that must read at a glance —
-   RAM, CPU, true-positive rate, wake-to-stream latency. */
-.eval-stat .value.hero {
-  font-size: clamp(1.9rem, 3.2vw, 2.7rem);
-}
-.eval-stat .value.primary { color: var(--success); }
-.eval-stat .unit {
+.stat .value.hero { font-size: clamp(1.9rem, 3.1vw, 2.6rem); letter-spacing: -0.5px; }
+.stat .value.sec { font-size: clamp(1.1rem, 1.7vw, 1.4rem); }
+.value.primary { color: var(--success); }
+.unit {
   font-family: var(--sans);
-  font-size: 0.68em;
-  font-weight: 400;
+  font-size: 0.42em;
+  font-weight: 500;
+  letter-spacing: 0;
   color: var(--text-dim);
-  margin-left: 0.2rem;
-  white-space: nowrap;
+  margin-left: 4px;
 }
-.bar-track { height: 5px; background: var(--border); border-radius: 3px; margin-top: 0.5rem; overflow: hidden; }
-.bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+.stat .value.sec .unit { font-size: 0.55em; }
+.bar-track { height: 4px; background: var(--border); border-radius: 2px; margin-top: var(--s1); overflow: hidden; }
+.bar-track.spacer { background: transparent; }
+.bar-fill { height: 100%; background: var(--accent); border-radius: 2px; }
 .bar-fill.warn { background: var(--danger); }
+
 .badge {
   display: inline-block;
-  font-size: 0.7rem;
+  font-size: 0.66rem;
   font-weight: 700;
   letter-spacing: 0.3px;
-  padding: 3px 9px;
+  padding: 2px 8px;
   border-radius: 4px;
   white-space: nowrap;
 }
 .badge.ok { background: #052e1a; color: var(--success); }
 .badge.bad { background: #3a0d0d; color: var(--danger); }
 
-/* System resources only: compact, fixed metric columns (do not stretch). */
-.resources-panel .eval-body {
+/* ---------- top row ---------- */
+.evaluation {
   display: grid;
-  grid-template-columns: max-content max-content max-content auto;
-  grid-template-rows: auto auto auto;
-  justify-content: start;
-  align-content: end;
-  align-items: end;
-  column-gap: 0;
-  row-gap: 0;
-  gap: 0;
-  flex: 1;
+  grid-template-columns: 1.3fr 1fr 0.8fr;
+  gap: var(--s2);
   min-height: 0;
 }
-.resources-panel .eval-stat {
-  display: grid;
-  grid-template-rows: subgrid;
-  grid-row: span 3;
-  flex: none;
-  min-width: 0;
-  justify-items: start;
-  align-content: end;
-  padding-right: 1.15rem;
-  margin-right: 1.15rem;
-  border-right: 1px solid var(--border);
-}
-.resources-panel .eval-stat .value {
-  display: inline-flex;
-  flex-direction: row;
-  align-items: baseline;
-  gap: 0.22rem;
-  width: max-content;
-  max-width: 100%;
-  white-space: nowrap;
-}
-.resources-panel .eval-stat .unit {
-  margin-left: 0;
-}
-.resources-panel .eval-stat.model-stat .value {
-  min-height: clamp(1.9rem, 3.2vw, 2.7rem);
-  align-items: flex-end;
-}
-.resources-panel .eval-stat.budget-stat {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  justify-content: flex-start;
-  grid-template-rows: none;
-  padding-right: 0;
-  margin-right: 0;
-  border-right: none;
-}
+.eval-panel { border-color: var(--border-strong); }
+.eval-body { flex: 1; min-height: 0; display: grid; align-items: end; }
+.resources-panel .eval-body { grid-template-columns: repeat(3, 1fr); }
+.detect-panel .eval-body { grid-template-columns: 1.25fr 1fr; }
+.latency-panel .eval-body { grid-template-columns: 1.25fr 1fr; }
+.eval-body > .stat { padding: 0 var(--s3); border-left: 1px solid var(--border); }
+.eval-body > .stat:first-child { padding-left: 0; border-left: none; }
+.eval-body > .stat:last-child { padding-right: 0; }
+.stat-stack { display: flex; flex-direction: column; gap: var(--s2); padding-left: var(--s3); border-left: 1px solid var(--border); }
+.stat-stack .stat { justify-content: flex-start; }
 
-/* ---------- LIVE PROCESSING (unified) ---------- */
-.processing-panel { min-height: 0; }
+/* ---------- live processing ---------- */
 .state-badge {
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   font-weight: 700;
-  letter-spacing: 0.6px;
-  padding: 2px 10px;
+  letter-spacing: 0.8px;
+  padding: 3px 10px;
   border-radius: 4px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   color: var(--text-dim);
 }
-.state-badge.listening { color: var(--text-dim); }
 .state-badge.wake_detected { color: var(--warn); border-color: var(--warn); }
 .state-badge.streaming { color: var(--accent); border-color: var(--accent); }
 .state-badge.transcribing { color: var(--success); border-color: var(--success); }
 
 .pipeline-body {
   display: grid;
-  grid-template-columns: 1.25fr 1fr 1fr;
-  gap: 0.9vw;
+  grid-template-columns: 1.6fr 1fr 1fr;
+  gap: var(--s2);
   flex: 1;
   min-height: 0;
 }
-.pipe-cell {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  min-width: 0;
-}
+.pipe-cell { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .pipe-cell .cell-label {
-  font-size: 0.62rem;
-  color: var(--text-dim);
-  margin-bottom: 0.3rem;
+  font-size: 0.66rem;
+  font-weight: 500;
+  color: var(--text-faint);
+  margin-bottom: 6px;
   flex-shrink: 0;
 }
 #wave-canvas {
@@ -877,82 +830,151 @@ body {
   flex: 1;
   min-height: 0;
   display: block;
-  background: #0b0f18;
+  background: var(--inset);
+  border: 1px solid var(--border);
   border-radius: 6px;
 }
 .spec-body {
   flex: 1;
   min-height: 0;
   border-radius: 6px;
+  border: 1px solid var(--border);
   overflow: hidden;
-  background: #0b0f18;
+  background: var(--inset);
   position: relative;
 }
-.spec-body img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
+.spec-body img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .spec-placeholder {
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-dim);
-  font-size: 0.66rem;
+  color: var(--text-faint);
+  font-size: 0.68rem;
   text-align: center;
-  padding: 0.7rem;
+  padding: var(--s1);
 }
 
-/* ---------- CURRENT EVENT ---------- */
-.current-event { flex-direction: row; align-items: stretch; gap: 1.4rem; }
-.ce-status-col {
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 0.3rem;
-  min-width: 9rem;
+/* ---------- bottom row ---------- */
+.bottom {
+  display: grid;
+  grid-template-columns: 37fr 63fr;
+  gap: var(--s2);
+  min-height: 0;
 }
-.ce-status-line { display: flex; align-items: center; gap: 0.4rem; font-size: 0.66rem; font-weight: 700; letter-spacing: 0.4px; color: var(--text-dim); }
-.ce-status-line .dot { width: 7px; height: 7px; }
+
+/* latest detection card */
+.latest-card { gap: var(--s2); }
+.ce-top { display: flex; flex-direction: column; gap: 6px; }
+.ce-status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  color: var(--text-faint);
+}
+.ce-status-line .dot { width: 7px; height: 7px; background: var(--text-faint); }
 .ce-status-line.active { color: var(--success); }
 .ce-status-line.active .dot { background: var(--success); }
-.ce-keyword { font-family: var(--mono); font-size: 1.4rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
-.ce-metrics { display: flex; gap: 1.6rem; align-items: center; flex-shrink: 0; }
-.ce-metric .label { font-size: 0.6rem; color: var(--text-dim); }
-.ce-metric .value { font-family: var(--mono); font-weight: 700; font-size: clamp(1rem, 1.7vw, 1.4rem); }
-.ce-transcript-col { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; border-left: 1px solid var(--border); padding-left: 1.3rem; }
-.ce-transcript-col .label { font-size: 0.6rem; color: var(--text-dim); margin-bottom: 0.2rem; }
-.ce-transcript-col .text { font-family: var(--mono); font-size: 1rem; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-/* ---------- HISTORY table ---------- */
-.table-wrap {
+.ce-keyword {
+  font-family: var(--mono);
+  font-size: clamp(1.7rem, 2.8vw, 2.4rem);
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--accent);
+  line-height: 1;
+}
+.ce-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: var(--s2) 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.ce-metric:last-child { padding-left: var(--s3); border-left: 1px solid var(--border); }
+.ce-metric .label { font-size: 0.68rem; color: var(--text-dim); margin-bottom: 6px; }
+.ce-metric .value { font-size: clamp(1.2rem, 1.9vw, 1.6rem); }
+.value.conf-ok { color: var(--success); }
+.value.conf-warn { color: var(--warn); }
+.value.conf-bad { color: var(--danger); }
+.ce-transcript-col {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
   border-radius: 6px;
+  padding: var(--s2) var(--s3);
 }
+.ce-transcript-col .label {
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: var(--s1);
+  flex-shrink: 0;
+}
+.ce-transcript-col .text {
+  flex: 1;
+  min-height: 0;
+  font-size: clamp(1.05rem, 1.6vw, 1.45rem);
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+/* history table */
+.table-wrap { flex: 1; min-height: 0; overflow-y: auto; border-radius: 6px; }
 table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
 thead th {
   position: sticky;
   top: 0;
   background: var(--panel);
   text-align: left;
-  color: var(--text-dim);
-  font-weight: 500;
-  padding: 0.4rem 0.5rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.63rem;
+  color: var(--text-faint);
+  font-weight: 600;
+  font-size: 0.62rem;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-strong);
+  white-space: nowrap;
 }
-td { padding: 0.38rem 0.5rem; border-bottom: 1px solid var(--border); font-family: var(--mono); }
-td.transcript-cell { font-family: var(--sans); color: var(--text); max-width: 18vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+tbody tr:hover td { background: rgba(255,255,255,0.02); }
+th:nth-child(2), th:nth-child(3), th:nth-child(5), th:nth-child(6),
+td:nth-child(2), td:nth-child(3), td:nth-child(5), td:nth-child(6) { text-align: right; }
+td:first-child { color: var(--text); }
+td.transcript-cell {
+  font-family: var(--sans);
+  color: var(--text);
+  max-width: 14vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .tag {
-  padding: 1px 7px;
+  padding: 2px 7px;
   border-radius: 4px;
-  font-size: 0.63rem;
+  font-size: 0.62rem;
   font-weight: 700;
   letter-spacing: 0.3px;
   font-family: var(--mono);
@@ -971,16 +993,16 @@ button.mark {
   font-weight: 700;
   letter-spacing: 0.2px;
   padding: 2px 7px;
-  margin-right: 4px;
+  margin-left: 4px;
   background: transparent;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   color: var(--text-dim);
   border-radius: 4px;
   cursor: pointer;
 }
 button.mark.correct:hover { border-color: var(--success); color: var(--success); }
 button.mark.wrong:hover { border-color: var(--danger); color: var(--danger); }
-.empty { color: var(--text-dim); font-size: 0.75rem; padding: 0.8rem 0.5rem; }
+.empty { color: var(--text-faint); font-size: 0.75rem; padding: var(--s2) 8px; font-family: var(--sans); }
 </style>
 </head>
 <body>
@@ -991,67 +1013,77 @@ button.mark.wrong:hover { border-color: var(--danger); color: var(--danger); }
       <div class="logo">EDGE<em>WAKE</em></div>
       <div class="tagline">On-device wake-word detection</div>
     </div>
+    <div class="meta-strip">
+      <div class="meta-item"><div class="label">Event</div><div class="value accent">{{ event_name }}</div></div>
+      <div class="meta-item"><div class="label">Team</div><div class="value">{{ team_name }}</div></div>
+      <div class="meta-item"><div class="label">Team ID</div><div class="value">{{ team_id }}</div></div>
+      <div class="meta-item"><div class="label">Problem statement</div><div class="value">{{ ps_id }}</div></div>
+    </div>
     <div class="status">
       <div class="conn-line"><div class="dot" id="conn-dot"></div><span id="conn-text">CHECKING...</span></div>
       <div id="status-meta"></div>
     </div>
   </div>
 
-  <!-- 1. EVALUATION — primary metrics, strong visual weight -->
+  <!-- 1. EVALUATION -->
   <div class="evaluation">
     <div class="panel eval-panel resources-panel">
-      <div class="section-tag">System resources</div>
+      <div class="panel-head"><div class="panel-title">System resources</div></div>
       <div class="eval-body">
-        <div class="eval-stat">
+        <div class="stat">
           <div class="label">RAM</div>
           <div class="value hero" id="ram-value"><span class="metric-num">--</span><span class="unit">/ {{ ram_budget }} KB</span></div>
           <div class="bar-track"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
         </div>
-        <div class="eval-stat">
+        <div class="stat">
           <div class="label">CPU</div>
           <div class="value hero" id="cpu-value"><span class="metric-num">--</span><span class="unit">/ {{ cpu_budget }}%</span></div>
           <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
         </div>
-        <div class="eval-stat model-stat">
+        <div class="stat">
           <div class="label">Model size</div>
-          <div class="value">{{ model_size }}<span class="unit"> KB</span></div>
+          <div class="value hero"><span class="metric-num">{{ model_size }}</span><span class="unit">KB</span></div>
+          <div class="bar-track spacer"></div>
         </div>
-        <div class="eval-stat budget-stat" id="budget-latest">--</div>
       </div>
     </div>
-    <div class="panel eval-panel">
-      <div class="section-tag">Detection</div>
+    <div class="panel eval-panel detect-panel">
+      <div class="panel-head"><div class="panel-title">Detection</div></div>
       <div class="eval-body">
-        <div class="eval-stat" style="flex:1.1">
+        <div class="stat">
           <div class="label">True-positive rate</div>
           <div class="value hero primary" id="tp-rate">--</div>
         </div>
-        <div class="eval-stat">
-          <div class="label">False activations</div>
-          <div class="value" id="fp-count">0</div>
-        </div>
-        <div class="eval-stat">
-          <div class="label">Total detections</div>
-          <div class="value" id="total-count">0</div>
+        <div class="stat-stack">
+          <div class="stat">
+            <div class="label">False activations</div>
+            <div class="value sec" id="fp-count">0</div>
+          </div>
+          <div class="stat">
+            <div class="label">Total detections</div>
+            <div class="value sec" id="total-count">0</div>
+          </div>
         </div>
       </div>
     </div>
-    <div class="panel eval-panel">
-      <div class="section-tag">Latency</div>
+    <div class="panel eval-panel latency-panel">
+      <div class="panel-head"><div class="panel-title">Latency</div></div>
       <div class="eval-body">
-        <div class="eval-stat" style="flex:1.2">
+        <div class="stat">
           <div class="label">Wake &rarr; stream</div>
           <div class="value hero" id="last-latency">-- <span class="unit">ms</span></div>
         </div>
-        <div class="eval-stat">
-          <div class="label">Average</div>
-          <div class="value" id="avg-latency">-- <span class="unit">ms</span></div>
+        <div class="stat-stack">
+          <div class="stat">
+            <div class="label">Average</div>
+            <div class="value sec" id="avg-latency">-- <span class="unit">ms</span></div>
+          </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- 2. LIVE PROCESSING — one coherent section -->
+  <!-- 2. LIVE PROCESSING -->
   <div class="panel processing-panel">
     <div class="panel-head">
       <div class="panel-title">Live processing</div>
@@ -1079,50 +1111,51 @@ button.mark.wrong:hover { border-color: var(--danger); color: var(--danger); }
     </div>
   </div>
 
-  <!-- 3. CURRENT EVENT -->
-  <div class="panel current-event">
-    <div class="ce-status-col">
-      <div class="ce-status-line" id="ce-status-line"><div class="dot"></div><span id="ce-status-text">NO DETECTION YET</span></div>
-      <div class="ce-keyword" id="ce-keyword">--</div>
-    </div>
-    <div class="ce-metrics">
-      <div class="ce-metric">
-        <div class="label">Confidence</div>
-        <div class="value" id="ce-confidence">--</div>
+  <!-- 3. LATEST DETECTION + LIVE DETECTIONS -->
+  <div class="bottom">
+    <div class="panel latest-card">
+      <div class="panel-head" style="margin-bottom:0"><div class="panel-title">Latest detection</div></div>
+      <div class="ce-top">
+        <div class="ce-status-line" id="ce-status-line"><div class="dot"></div><span id="ce-status-text">NO DETECTION YET</span></div>
+        <div class="ce-keyword" id="ce-keyword">--</div>
       </div>
-      <div class="ce-metric">
-        <div class="label">Wake &rarr; stream</div>
-        <div class="value" id="ce-latency">--</div>
+      <div class="ce-metrics">
+        <div class="ce-metric">
+          <div class="label">Confidence</div>
+          <div class="value" id="ce-confidence">--</div>
+        </div>
+        <div class="ce-metric">
+          <div class="label">Latency</div>
+          <div class="value" id="ce-latency">--</div>
+        </div>
+      </div>
+      <div class="ce-transcript-col">
+        <div class="label">Latest transcript</div>
+        <div class="text" id="ce-transcript">Waiting for first detection...</div>
       </div>
     </div>
-    <div class="ce-transcript-col">
-      <div class="label">Latest transcript</div>
-      <div class="text" id="ce-transcript">Waiting for first detection...</div>
-    </div>
-  </div>
 
-  <!-- 4. HISTORY -->
-  <div class="panel">
-    <div class="panel-head"><div class="panel-title">Live detections</div></div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>RAM</th>
-            <th>CPU</th>
-            <th>Budget</th>
-            <th>Wake&rarr;stream</th>
-            <th>Duration</th>
-            <th>Conf.</th>
-            <th>Transcript</th>
-            <th>Result</th>
-          </tr>
-        </thead>
-        <tbody id="log-body">
-          <tr><td colspan="9" class="empty">Waiting for first detection...</td></tr>
-        </tbody>
-      </table>
+    <div class="panel">
+      <div class="panel-head"><div class="panel-title">Live detections</div></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>RAM</th>
+              <th>CPU</th>
+              <th>Budget</th>
+              <th>Latency</th>
+              <th>Conf.</th>
+              <th>Transcript</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="log-body">
+            <tr><td colspan="8" class="empty">Waiting for first detection...</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -1202,13 +1235,13 @@ async function refresh() {
       document.getElementById('cpu-bar').className = 'bar-fill' + (cpuPct > 90 ? ' warn' : '');
 
       document.getElementById('last-latency').innerHTML = wakeMs + ' <span class="unit">ms</span>';
-      document.getElementById('budget-latest').innerHTML = budgetBadge(!!data.latest.within_budget);
 
       const ceLine = document.getElementById('ce-status-line');
       ceLine.classList.add('active');
       document.getElementById('ce-status-text').textContent = 'WAKE DETECTED';
       document.getElementById('ce-keyword').textContent = WAKE_KEYWORD;
       document.getElementById('ce-confidence').textContent = conf != null ? conf.toFixed(1) + '%' : '--';
+      document.getElementById('ce-confidence').className = 'value ' + confidenceClass(conf);
       document.getElementById('ce-latency').textContent = wakeMs + ' ms';
       document.getElementById('ce-transcript').textContent = data.latest.transcript || 'Could not recognize speech.';
 
@@ -1246,11 +1279,10 @@ async function refresh() {
 
     const tbody = document.getElementById('log-body');
     if (allRows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">Waiting for first detection...</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">Waiting for first detection...</td></tr>';
     } else {
       tbody.innerHTML = allRows.map(function(row) {
         const wake = row.stream_start_latency_ms != null ? row.stream_start_latency_ms : row.latency_ms;
-        const dur = row.utterance_duration_ms != null ? row.utterance_duration_ms : '--';
         const conf = row.confidence != null ? Number(row.confidence).toFixed(1) + '%' : '--';
         const confCls = confidenceClass(row.confidence);
 
@@ -1260,7 +1292,6 @@ async function refresh() {
           '<td>' + row.cpu_percent + '%</td>' +
           '<td>' + budgetBadge(!!row.within_budget) + '</td>' +
           '<td>' + wake + ' ms</td>' +
-          '<td>' + dur + ' ms</td>' +
           '<td class="' + confCls + '">' + conf + '</td>' +
           '<td class="transcript-cell">' + (row.transcript ? row.transcript.slice(0, 40) : '--') + '</td>' +
           '<td>' + resultTag(row) + '</td>' +
@@ -1282,7 +1313,7 @@ async function refreshWave() {
     const h = canvas.height;
     const samples = data.samples || [];
 
-    ctx.fillStyle = '#0b0f18';
+    ctx.fillStyle = '#0a0e15';
     ctx.fillRect(0, 0, w, h);
 
     ctx.strokeStyle = '#1c2434';
@@ -1335,6 +1366,10 @@ def home():
         ram_budget=RAM_BUDGET_KB,
         cpu_budget=CPU_BUDGET_PERCENT,
         model_size=MODEL_SIZE_KB,
+        event_name=EVENT_NAME,
+        team_name=TEAM_NAME,
+        team_id=TEAM_ID,
+        ps_id=PS_ID,
         wake_threshold_percent=round(WAKE_THRESHOLD * 100, 2)
     )
 
